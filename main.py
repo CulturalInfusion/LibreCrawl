@@ -572,7 +572,6 @@ def request_magic_link():
         return jsonify({'success': False, 'message': 'Failed to generate login link. Please try again.'})
 
     magic_url = f"{MAIN_APP_URL}/auth/magic?token={token}"
-    print(f"[Magic Link] {email} → {magic_url}", flush=True)
     send_magic_link_email(email, magic_url)
     return jsonify({'success': True, 'message': 'Check your email for a login link.'})
 
