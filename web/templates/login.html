@@ -174,6 +174,30 @@
         .alert.show {
             display: block;
         }
+
+        .divider {
+            text-align: center;
+            margin: 24px 0;
+            color: #9ca3af;
+            font-size: 14px;
+        }
+
+        .register-link {
+            text-align: center;
+            margin-top: 24px;
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .register-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .register-link a:hover {
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body>
@@ -201,6 +225,21 @@
 
         {% else %}
 
+        <!-- Normal login -->
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required autofocus maxlength="50">
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit" class="btn" id="loginBtn">Login</button>
+        </form>
+
+        <div class="divider">or sign in with email</div>
+
         <!-- Step 1: Email -->
         <div id="stepEmail">
             <form id="emailForm">
@@ -227,6 +266,12 @@
 
         {% if not guest_disabled and not skip_auth %}
         <button class="btn btn-guest" id="guestBtn">Continue as Guest (3 crawls/24h)</button>
+        {% endif %}
+
+        {% if not skip_auth %}
+        <div class="register-link">
+            Don't have an account? <a href="/register" id="registerLink">Register here</a>
+        </div>
         {% endif %}
     </div>
 
@@ -342,6 +387,46 @@
             document.getElementById('email').value = '';
             document.getElementById('email').focus();
         });
+
+        const loginBtn = document.getElementById('loginBtn');
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hideAlert();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            loginBtn.disabled = true;
+            loginBtn.textContent = 'Logging in...';
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showAlert(data.message, 'success');
+                    setTimeout(() => { window.location.href = '/'; }, 500);
+                } else {
+                    showAlert(data.message, 'error');
+                    loginBtn.disabled = false;
+                    loginBtn.textContent = 'Login';
+                }
+            } catch {
+                showAlert('An error occurred. Please try again.', 'error');
+                loginBtn.disabled = false;
+                loginBtn.textContent = 'Login';
+            }
+        });
+
+        const registrationDisabled = {{ 'true' if registration_disabled else 'false' }};
+        const registerLink = document.getElementById('registerLink');
+        if (registrationDisabled && registerLink) {
+            registerLink.addEventListener('click', (e) => {
+                e.preventDefault();
+                window.alert('Registrations are disabled');
+            });
+        }
 
         {% endif %}
 
