@@ -1662,6 +1662,7 @@ def create_devops_ticket():
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.Priority',           'value': az_priority},
         {'op': 'add', 'path': '/fields/System.AssignedTo',                        'value': sm_email},
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', 'value': ac_html},
+        {'op': 'add', 'path': '/fields/System.AreaPath',                            'value': f'{project}\\WP'},
         {'op': 'add', 'path': '/relations/-', 'value': {
             'rel': 'System.LinkTypes.Hierarchy-Reverse',
             'url': f'https://dev.azure.com/{org}/_apis/wit/workitems/{parent_id}',
