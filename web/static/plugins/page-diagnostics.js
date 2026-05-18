@@ -262,13 +262,39 @@ LibreCrawlPlugin.register({
                     return categoryMatch && typeMatch;
                 });
 
+                exportBtn.disabled = true;
+                exportBtn.textContent = 'Verifying...';
+
+                let cleanedIssues = filteredIssues;
+                try{
+                    const probeResponse = await fetch('/api/probe_http_issues', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ issues: filteredIssues })
+                    });
+                    const probeData = await probeResponse.json();
+                    if (probeData.success && probeData.resolved_urls?.length > 0) {
+                        const resolvedKeys = new Set(
+                            probeData.resolved_urls.map(u => u.url + '|' + u.issue)
+                        );
+                        cleanedIssues = filteredIssues.filter(issue => !resolvedKeys.has(issue.url + '|' + issue.issue));
+                    }
+                } catch (error) {
+                    console.error('Error occurred while probing HTTP issues:', error);
+                }
+
+                exportBtn.textContent = 'Exporting...';
+                exportBtn.disabled = false;
+                exportBtn.textContent = 'Verified CSV';
+
+
                 const response = await fetch('/api/export_data', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         format: 'csv',
                         fields: ['issues_detected'],
-                        localData: { urls: data.urls, links: data.links, issues: filteredIssues }
+                        localData: { urls: data.urls, links: data.links, issues: cleanedIssues }
                     })
                 });
                 const exportData = await response.json();
