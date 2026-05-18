@@ -217,21 +217,74 @@ LibreCrawlPlugin.register({
         `;
 
         // Attach category filter event listener
-        const filterSelect = container.querySelector('#pd-category-filter');
-        if (filterSelect) {
-            filterSelect.addEventListener('change', () => {
-                const selected = filterSelect.value;
-                const table = container.querySelector('#pd-issues-table');
-                if (!table) return;
-                const rows = table.querySelectorAll('tbody tr');
-                rows.forEach(row => {
-                    const category = row.dataset.category;
-                    if (selected === 'All' || category === selected) {
-                        row.style.display = '';
+        const categoryFilterSelect = container.querySelector('#pd-category-filter');
+        const typeFilterSelect = container.querySelector('#pd-type-filter');
+
+        const HTTP_ERROR_PATTERNS = ['Client Error', 'Server Error', 'Redirect', 'DNS Not Found', 'Connection Refused', 'Request Timeout', 'SSL/TLS Error', 'Broken Image', '404 Error'];
+        const applyFilters = () => {
+            const selectedCategory = categoryFilterSelect.value;
+            const selectedType = typeFilterSelect.value;
+            const table = container.querySelector('#pd-issues-table');
+            if (!table) return;
+            table.querySelectorAll('tbody tr').forEach(row => {
+                const categoryMatch = selectedCategory === 'All' || row.dataset.category === selectedCategory;
+                let typeMatch;
+                if (selectedType === 'All') {
+                    typeMatch = true;
+                } else if (selectedType === 'http_error') {
+                    typeMatch = HTTP_ERROR_PATTERNS.some(pattern => (row.dataset.issueName || '').includes(pattern));
+                } else {
+                    typeMatch = row.dataset.type === selectedType;
+                }
+                row.style.display = (categoryMatch && typeMatch) ? '' : 'none';
+            });
+        };
+
+        categoryFilterSelect.addEventListener('change', applyFilters);
+        typeFilterSelect.addEventListener('change', applyFilters);
+
+        const exportBtn = container.querySelector('#pd-export-csv');
+        if (exportBtn) {
+            exportBtn.addEventListener('click', async () => {
+                const selectedCategory = categoryFilterSelect.value;
+                const selectedType = typeFilterSelect.value;
+
+                const filteredIssues = (issues || []).filter(issue => {
+                    const categoryMatch = selectedCategory === 'All' || issue.category === selectedCategory;
+                    let typeMatch;
+                    if (selectedType === 'All') {
+                        typeMatch = true;
+                    } else if (selectedType === 'http_error') {
+                        typeMatch = HTTP_ERROR_PATTERNS.some(p => (issue.issue || '').includes(p));
                     } else {
-                        row.style.display = 'none';
+                        typeMatch = issue.type === selectedType;
                     }
+                    return categoryMatch && typeMatch;
                 });
+
+                const response = await fetch('/api/export_data', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        format: 'csv',
+                        fields: ['issues_detected'],
+                        localData: { urls: data.urls, links: data.links, issues: filteredIssues }
+                    })
+                });
+                const exportData = await response.json();
+
+                if (!exportData.success) return;
+
+                const blob = new Blob([exportData.content], { type: exportData.mimetype });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = url;
+                a.download = exportData.filename;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
             });
         }
 
@@ -613,6 +666,15 @@ LibreCrawlPlugin.register({
                     <select id="pd-category-filter" style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 6px 12px; border-radius: 6px; font-size: 13px;">
                         ${categoryOptions}
                     </select>
+                    <label style="font-size: 13px; color: #9ca3af; margin-left: 20px;"> Type: </label>
+                    <select id = "pd-type-filter" style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 6px 12px; border-radius: 6px; font-size: 13px;">
+                        <option value="All">All types</option>
+                        <option value="http_error">Error</option>
+                        <option value="warning">Warning</option>
+                    </select>
+                    <button id = "pd-export-csv" style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 6px 12px; border-radius: 6px; font-size: 13px; margin-left: 20px; cursor: pointer;">
+                        Export CSV
+                    </button>
                 </div>
                 <div style="overflow-x: auto;">
                     <table class="data-table" style="width: 100%; border-collapse: collapse;" id="pd-issues-table">
@@ -649,7 +711,7 @@ LibreCrawlPlugin.register({
         const cacheKey = 'ai_' + btoa(unescape(encodeURIComponent(issue.url + '|' + issue.issue))).replace(/[=+/]/g, '');
 
         return `
-            <tr style="border-bottom: 1px solid #374151;" data-category="${category}" data-cache-key="${cacheKey}">
+            <tr style="border-bottom: 1px solid #374151;" data-category="${category}" data-type = "${issue.type || 'info'}" data-issue-name="${this.utils.escapeHtml(issue.issue || '')}" data-cache-key="${cacheKey}">
                 <td style="padding: 12px; color: #cbd5e1; font-size: 13px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
                     <a href="${url}" target="_blank" style="color: #3b82f6; text-decoration: none;">${shortUrl}</a>
                 </td>

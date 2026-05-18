@@ -10,6 +10,7 @@ import secrets
 import string
 import os
 import requests
+import re
 from io import StringIO
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
@@ -462,7 +463,7 @@ def filter_issues_by_exclusion_patterns(issues, exclusion_patterns):
 def generate_issues_csv_export(issues):
     """Generate CSV export for issues data"""
     output = StringIO()
-    fieldnames = ['url', 'type', 'category', 'issue', 'details']
+    fieldnames = ['url', 'type', 'category', 'issue', 'details', 'affected_asset_url']
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
 
@@ -472,11 +473,16 @@ def generate_issues_csv_export(issues):
             'type': issue.get('type', ''),
             'category': issue.get('category', ''),
             'issue': issue.get('issue', ''),
-            'details': issue.get('details', '')
+            'details': issue.get('details', ''),
+            'affected_asset_url': issue.get('affected_asset_url', '')
         }
         writer.writerow(row)
 
     return output.getvalue()
+
+def __extract_asset_url(details): 
+    match = re.search(r'(?:Image returned \d+|Image does not respond):\s*(.+)', details or '')
+    return match.group(1).strip() if match else '' 
 
 def generate_issues_json_export(issues):
     """Generate JSON export for issues data"""
