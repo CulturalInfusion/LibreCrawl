@@ -216,14 +216,17 @@ LibreCrawlPlugin.register({
             </div>
         `;
 
-        // Attach category filter event listener
+        // Attach filter event listeners (category + type + URL search)
         const categoryFilterSelect = container.querySelector('#pd-category-filter');
         const typeFilterSelect = container.querySelector('#pd-type-filter');
+        const urlSearchInput = container.querySelector('#pd-url-search');
 
         const HTTP_ERROR_PATTERNS = ['Client Error', 'Server Error', 'Redirect', 'DNS Not Found', 'Connection Refused', 'Request Timeout', 'SSL/TLS Error', 'Broken Image', '404 Error'];
+
         const applyFilters = () => {
-            const selectedCategory = categoryFilterSelect.value;
-            const selectedType = typeFilterSelect.value;
+            const selectedCategory = categoryFilterSelect ? categoryFilterSelect.value : 'All';
+            const selectedType = typeFilterSelect ? typeFilterSelect.value : 'All';
+            const urlQuery = urlSearchInput ? urlSearchInput.value.trim().toLowerCase() : '';
             const table = container.querySelector('#pd-issues-table');
             if (!table) return;
             table.querySelectorAll('tbody tr').forEach(row => {
@@ -236,18 +239,21 @@ LibreCrawlPlugin.register({
                 } else {
                     typeMatch = row.dataset.type === selectedType;
                 }
-                row.style.display = (categoryMatch && typeMatch) ? '' : 'none';
+                const urlAnchor = row.querySelector('a');
+                const urlMatch = !urlQuery || (urlAnchor && urlAnchor.getAttribute('href').toLowerCase().includes(urlQuery));
+                row.style.display = (categoryMatch && typeMatch && urlMatch) ? '' : 'none';
             });
         };
 
-        categoryFilterSelect.addEventListener('change', applyFilters);
-        typeFilterSelect.addEventListener('change', applyFilters);
+        if (categoryFilterSelect) categoryFilterSelect.addEventListener('change', applyFilters);
+        if (typeFilterSelect) typeFilterSelect.addEventListener('change', applyFilters);
+        if (urlSearchInput) urlSearchInput.addEventListener('input', applyFilters);
 
         const exportBtn = container.querySelector('#pd-export-csv');
         if (exportBtn) {
             exportBtn.addEventListener('click', async () => {
-                const selectedCategory = categoryFilterSelect.value;
-                const selectedType = typeFilterSelect.value;
+                const selectedCategory = categoryFilterSelect ? categoryFilterSelect.value : 'All';
+                const selectedType = typeFilterSelect ? typeFilterSelect.value : 'All';
 
                 const filteredIssues = (issues || []).filter(issue => {
                     const categoryMatch = selectedCategory === 'All' || issue.category === selectedCategory;
@@ -266,7 +272,7 @@ LibreCrawlPlugin.register({
                 exportBtn.textContent = 'Verifying...';
 
                 let cleanedIssues = filteredIssues;
-                try{
+                try {
                     const probeResponse = await fetch('/api/probe_http_issues', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -283,10 +289,8 @@ LibreCrawlPlugin.register({
                     console.error('Error occurred while probing HTTP issues:', error);
                 }
 
-                exportBtn.textContent = 'Exporting...';
                 exportBtn.disabled = false;
                 exportBtn.textContent = 'Verified CSV';
-
 
                 const response = await fetch('/api/export_data', {
                     method: 'POST',
@@ -687,8 +691,8 @@ LibreCrawlPlugin.register({
                 <h3 style="font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #e5e7eb;">
                     Issues Table
                 </h3>
-                <div style="margin-bottom: 16px;">
-                    <label style="font-size: 13px; color: #9ca3af; margin-right: 8px;">Filter by category:</label>
+                <div style="margin-bottom: 16px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;">
+                    <label style="font-size: 13px; color: #9ca3af; margin-right: 4px;">Filter by category:</label>
                     <select id="pd-category-filter" style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 6px 12px; border-radius: 6px; font-size: 13px;">
                         ${categoryOptions}
                     </select>
@@ -701,6 +705,12 @@ LibreCrawlPlugin.register({
                     <button id = "pd-export-csv" style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 6px 12px; border-radius: 6px; font-size: 13px; margin-left: 20px; cursor: pointer;">
                         Export CSV
                     </button>
+                    <input
+                        id="pd-url-search"
+                        type="text"
+                        placeholder="Search URL…"
+                        style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 6px 12px; border-radius: 6px; font-size: 13px; margin-left: auto; width: 260px;"
+                    />
                 </div>
                 <div style="overflow-x: auto;">
                     <table class="data-table" style="width: 100%; border-collapse: collapse;" id="pd-issues-table">
