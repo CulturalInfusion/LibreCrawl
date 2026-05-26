@@ -1,15 +1,14 @@
-name: "CodeQL Security Scan"
+name: "Security Scan"
 
- 
 on:
   push:
-    branches: ["**"]  # Run on ALL branches, including feature branches
+    branches: ["**"]
   pull_request:
-    branches: ["**"]  # Run on PRs targeting any branch
-  # schedule:
-  #   # Runs at 03:00 UTC every Monday — catches newly disclosed CVEs
-  #   - cron: "0 3 * * 1"
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+    branches: ["**"]
+  schedule:
+    # Runs at 03:00 UTC every Monday — catches newly disclosed CVEs
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
 
 jobs:
   # ── Job 1: CodeQL — Python static analysis ────────────────────────────
@@ -18,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      security-events: write   # Required to upload SARIF results
+      security-events: write
       actions: read
       contents: read
 
@@ -29,17 +28,9 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          # LibreCrawl backend is Python/Flask only.
-          # The frontend is plain vanilla JS with no Node/npm project,
-          # so the javascript-typescript extractor is intentionally omitted.
           languages: python
-
-          # security-extended = all security-and-quality queries
-          # + high-precision experimental security queries.
           queries: security-extended
 
-      # For interpreted languages (Python) autobuild is a no-op —
-      # CodeQL analyses the source directly without compiling.
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
 
@@ -50,9 +41,6 @@ jobs:
           upload: true
 
   # ── Job 2: Hadolint — Dockerfile linting ──────────────────────────────
-  # LibreCrawl ships a Dockerfile; this catches security misconfigs
-  # (running as root, unpinned base images, ADD instead of COPY, etc.)
-  # without executing the container.
   hadolint:
     name: Hadolint (Dockerfile)
     runs-on: ubuntu-latest
@@ -70,11 +58,8 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
-          # Upload results to Security tab as SARIF
           format: sarif
           output-file: hadolint-results.sarif
-          # Don't fail the build — report as warnings so you can review first.
-          # Change to 'error' once you've triaged existing findings.
           no-fail: true
 
       - name: Upload Hadolint SARIF
@@ -82,3 +67,32 @@ jobs:
         with:
           sarif_file: hadolint-results.sarif
           category: dockerfile
+
+  # ── Job 3: Gitleaks — Secret & sensitive data detection ───────────────
+  # Scans ALL git history + staged changes for hardcoded secrets:
+  # API keys, tokens, passwords, connection strings, private keys, etc.
+  # FAILS the check if any secret is found — blocks merging.
+  gitleaks:
+    name: Gitleaks (Secret Scan)
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # Required to post findings as PR review comments
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        # fetch-depth: 0 fetches the FULL git history so Gitleaks
+        # can scan every commit, not just the latest snapshot.
+        # Without this it only sees the tip of the branch.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE is only needed for private repos on paid plans.
+          # For public repos (like LibreCrawl) it is not required.
