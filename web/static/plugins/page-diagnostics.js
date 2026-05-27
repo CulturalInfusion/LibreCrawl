@@ -273,7 +273,7 @@ LibreCrawlPlugin.register({
 
                 let cleanedIssues = filteredIssues;
                 try {
-                    const probeResponse = await fetch('/api/probe_http_issues', {
+                    const probeResponse = await fetch('/api/probe_http_errors', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ issues: filteredIssues })
