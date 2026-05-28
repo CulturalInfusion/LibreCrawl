@@ -53,9 +53,40 @@ def create_devops_ticket(url: str, issue: str, category: str, issue_type: str, a
     return response.json()
 
 @mcp.tool()
+async def create_bulk_tickets(approved: list[dict], project: str, user_id: str | None = None,):
+    """
+    Create multiple tickets from approved crawl issues.
+    """
+    response = requests.post(f"{BASE_URL}/api/create_bulk_tickets", json={
+        "approved" : approved,
+    })
+    return response.json()
+
+
+@mcp.tool()
 def probe_urls(issues: list) -> dict:
     """Probes a list of URLs to check their HTTP status codes and returns the results."""
-    response = requests.post(f"{BASE_URL}/api/probe_http_errors", json={"issues" : issues)
+    response = requests.post(f"{BASE_URL}/api/probe_http_errors", json={"issues" : issues})
+    return response.json()
+
+@mcp.tool()
+def poll_workflow_trigger() -> dict:
+    """Polls the status of an ongoing workflow trigger. Returns status and details. Keep calling until status equals completed."""
+    response = requests.get(f"{BASE_URL}/api/agent/workflow_trigger")
+    return response.json()
+
+@mcp.tool()
+def post_triage_results(issues: list) -> dict:
+    """Posts the results of a triage decision for a given issue."""
+    response = requests.post(f"{BASE_URL}/api/agent/triage", json={
+        "issues": issues,
+    })
+    return response.json()
+
+@mcp.tool()
+def poll_approval() -> dict:
+    """Polls for approval status of a given issue. Returns status and details. Keep calling until status equals approved or rejected."""
+    response = requests.get(f"{BASE_URL}/api/agent/approval")
     return response.json()
 
 if __name__ == "__main__":

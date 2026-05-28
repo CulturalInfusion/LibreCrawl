@@ -1622,10 +1622,8 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             'error': str(e)
         }), 500
 
-@app.route('/api/create_devops_ticket', methods=['POST'])
-@login_required
-def create_devops_ticket():
-    """Create an Azure DevOps Product Backlog Item from a Page Diagnostics issue"""
+def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_how_to_fix, ai_priority, ai_role, project, parent_id, user_id=None):
+    """Shared ticket creation logic used by both the single-issue route and bulk agent route."""
     import base64
     from urllib.parse import urlparse, quote
 
@@ -1633,30 +1631,9 @@ def create_devops_ticket():
     pat      = os.getenv('AZURE_DEVOPS_PAT')
     sm_email = os.getenv('AZURE_DEVOPS_SM_EMAIL')
 
-    missing = [k for k, v in {
-        'AZURE_DEVOPS_ORG':      org,
-        'AZURE_DEVOPS_PAT':      pat,
-        'AZURE_DEVOPS_SM_EMAIL': sm_email,
-    }.items() if not v]
+    missing = [k for k, v in {'AZURE_DEVOPS_ORG': org, 'AZURE_DEVOPS_PAT': pat, 'AZURE_DEVOPS_SM_EMAIL': sm_email}.items() if not v]
     if missing:
-        return jsonify({'success': False, 'error': f'Missing .env variables: {", ".join(missing)}'}), 400
-
-    data        = request.get_json()
-    url         = data.get('url', '')
-    issue       = data.get('issue', '')
-    category    = data.get('category', '')
-    issue_type  = data.get('issue_type', 'warning')
-    ai_exp      = data.get('ai_explanation', '')
-    ai_fix      = data.get('ai_how_to_fix', '')
-    ai_priority = data.get('ai_priority', 'medium')
-
-    project   = data.get('project_override') or os.getenv('AZURE_DEVOPS_PROJECT', '')
-    parent_id = data.get('parent_id_override') or os.getenv('AZURE_DEVOPS_PARENT_ID', '')
-
-    if not project:
-        return jsonify({'success': False, 'error': 'No Azure project selected. Use the Project dropdown next to the Clear button.'}), 400
-    if not parent_id:
-        return jsonify({'success': False, 'error': 'No Feature selected. Use the Feature dropdown next to the Clear button.'}), 400
+        return False, {'error': f'Missing .env variables: {", ".join(missing)}'}
 
     if issue_type == 'error':
         az_priority, sup_label, moscow = (1, 'Critical', 'Must') if ai_priority == 'high' else (2, 'High', 'Should')
@@ -1666,18 +1643,17 @@ def create_devops_ticket():
         az_priority, sup_label, moscow = 4, 'Informational', "Won't"
 
     valid_roles = {'Webmaster', 'Copywriter / Content Editor', 'Web Developer', 'Designer'}
-    ai_role = data.get('ai_role', '')
-    role = ai_role if ai_role in valid_roles else CATEGORY_ROLE_MAP.get(category, 'Web Developer')
-    fix_items = [p.strip() for p in ai_fix.split('•') if p.strip()]
+    role      = ai_role if ai_role in valid_roles else CATEGORY_ROLE_MAP.get(category, 'Web Developer')
+    fix_items = [p.strip() for p in ai_how_to_fix.split('•') if p.strip()]
     fix_html  = '<ul>' + ''.join(f'<li>{item}</li>' for item in fix_items) + '</ul>' \
-                if fix_items else f'<p>{ai_fix}</p>'
+                if fix_items else f'<p>{ai_how_to_fix}</p>'
 
     parsed    = urlparse(url)
     short_url = (parsed.path.rstrip('/') or parsed.netloc)[-60:]
 
     description_html = (
         f'<h3>🧩 Summary</h3>'
-        f'<p>{ai_exp} This issue was detected by LibreCrawl on '
+        f'<p>{ai_explanation} This issue was detected by LibreCrawl on '
         f'<a href="{url}">{url}</a>. '
         f'Category: {category}. Severity: {sup_label} — Priority {az_priority} ({moscow}).</p>'
         f'<h3>👥 Responsibility</h3>'
@@ -1710,7 +1686,7 @@ def create_devops_ticket():
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.Priority',           'value': az_priority},
         {'op': 'add', 'path': '/fields/System.AssignedTo',                        'value': sm_email},
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', 'value': ac_html},
-        {'op': 'add', 'path': '/fields/System.AreaPath',                            'value': f'{project}\\{os.environ.get("AZURE_AREA_SUFFIX")}'},
+        {'op': 'add', 'path': '/fields/System.AreaPath',                          'value': f'{project}\\{os.environ.get("AZURE_AREA_SUFFIX")}'},
         {'op': 'add', 'path': '/relations/-', 'value': {
             'rel': 'System.LinkTypes.Hierarchy-Reverse',
             'url': f'https://dev.azure.com/{org}/_apis/wit/workitems/{parent_id}',
@@ -1724,12 +1700,43 @@ def create_devops_ticket():
         ticket_id  = resp.json()['id']
         ticket_url = f'https://dev.azure.com/{org}/{quote(project)}/_workitems/edit/{ticket_id}'
         from src.crawl_db import save_devops_ticket
-        save_devops_ticket(url, issue, category, ticket_id, ticket_url, user_id=session.get('user_id'))
-        return jsonify({'success': True, 'ticket_id': ticket_id, 'ticket_url': ticket_url, 'title': title})
+        save_devops_ticket(url, issue, category, ticket_id, ticket_url, user_id=user_id)
+        return True, {'ticket_id': ticket_id, 'ticket_url': ticket_url, 'title': title}
     except requests.exceptions.HTTPError:
-        return jsonify({'success': False, 'error': f'Azure DevOps {resp.status_code}: {resp.text}'}), 500
+        return False, {'error': f'Azure DevOps {resp.status_code}: {resp.text}'}
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return False, {'error': str(e)}
+
+
+@app.route('/api/create_devops_ticket', methods=['POST'])
+@login_required
+def create_devops_ticket():
+    """Create an Azure DevOps Product Backlog Item from a Page Diagnostics issue"""
+    data        = request.get_json()
+    url         = data.get('url', '')
+    issue       = data.get('issue', '')
+    category    = data.get('category', '')
+    issue_type  = data.get('issue_type', 'warning')
+    ai_exp      = data.get('ai_explanation', '')
+    ai_fix      = data.get('ai_how_to_fix', '')
+    ai_priority = data.get('ai_priority', 'medium')
+    ai_role     = data.get('ai_role', '')
+
+    project   = data.get('project_override') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    parent_id = data.get('parent_id_override') or os.getenv('AZURE_DEVOPS_PARENT_ID', '')
+
+    if not project:
+        return jsonify({'success': False, 'error': 'No Azure project selected. Use the Project dropdown next to the Clear button.'}), 400
+    if not parent_id:
+        return jsonify({'success': False, 'error': 'No Feature selected. Use the Feature dropdown next to the Clear button.'}), 400
+
+    success, result = _create_single_ticket(
+        url, issue, category, issue_type, ai_exp, ai_fix, ai_priority, ai_role,
+        project, parent_id, user_id=session.get('user_id')
+    )
+    if success:
+        return jsonify({'success': True, **result})
+    return jsonify({'success': False, 'error': result['error']}), 500
 
 @app.route('/api/devops_tickets/check', methods=['POST'])
 @login_required
@@ -1853,6 +1860,45 @@ def agent_approval():
     _agent_state["approval"] = data.get("approval", [])
     _agent_state["status"] = "Approval received"
     return jsonify({'success': True})
+
+@app.route("/api/agent/approval", methods=['GET'])
+def get_approval():
+    global _agent_state
+    if _agent_state.get("status") != "Approval received":
+        return jsonify({'success': False, 'error': 'Approval not received'}), 400
+    return jsonify({'success': True, 'approval': _agent_state.get("approval", [])})
+
+@app.route("/api/agent/create_bulk_tickets", methods=['POST'])
+def create_bulk_tickets():
+    global _agent_state
+    data      = request.get_json()
+    approved  = data.get("approved", [])
+    project   = _agent_state.get("project", "")
+    parent_id = _agent_state.get("feature", "")
+
+    created = []
+    errors  = []
+
+    for issue in approved:
+        success, result = _create_single_ticket(
+            issue.get("url", ""),
+            issue.get("issue", ""),
+            issue.get("category", ""),
+            issue.get("type", "warning"),
+            issue.get("explanation", ""),
+            issue.get("how_to_fix", ""),
+            issue.get("priority", "medium"),
+            issue.get("role", ""),
+            project,
+            parent_id,
+            user_id=session.get('user_id')
+        )
+        if success:
+            created.append(result)
+        else:
+            errors.append({**result, 'url': issue.get("url", "")})
+
+    return jsonify({'success': True, 'created': created, 'errors': errors})
 
 def main():
     import signal
