@@ -1,0 +1,248 @@
+name: "Security Scan"
+
+on:
+  pull_request:
+    branches: ["**"]
+  schedule:
+    # Runs at 03:00 UTC every Monday — catches newly disclosed CVEs
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  # ── Job 1: CodeQL — Python static analysis ────────────────────────────
+  codeql:
+    name: CodeQL (Python)
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+          upload: true
+
+  # ── Job 2: Hadolint — Dockerfile linting ──────────────────────────────
+  hadolint:
+    name: Hadolint (Dockerfile)
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          format: sarif
+          output-file: hadolint-results.sarif
+          no-fail: true
+
+      - name: Upload Hadolint SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint-results.sarif
+          category: dockerfile
+
+  # ── Job 3: Gitleaks — Secret & sensitive data detection ───────────────
+  # Scans ALL git history + staged changes for hardcoded secrets:
+  # API keys, tokens, passwords, connection strings, private keys, etc.
+  # FAILS the check if any secret is found — blocks merging.
+  gitleaks:
+    name: Gitleaks (Secret Scan)
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # Required to post findings as PR review comments
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        # fetch-depth: 0 fetches the FULL git history so Gitleaks
+        # can scan every commit, not just the latest snapshot.
+        # Without this it only sees the tip of the branch.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        run: |
+          GITLEAKS_VERSION=$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+          wget -q "https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks version
+ 
+      - name: Run Gitleaks
+        # Exits with code 1 if any secret is found — fails the check.
+        # --redact hides the actual secret value from the log output.
+        # --verbose shows which file and line triggered the finding.
+        run: gitleaks detect --source . --verbose --redact
+
+
+  # ── Job 4: pip-audit — Python dependency vulnerability scanning (SCA) ──
+  # Checks every package in requirements.txt against PyPI Advisory DB
+  # and OSV (Open Source Vulnerabilities) for known CVEs.
+  # Maintained by PyPA — the Python Packaging Authority themselves.
+  pip-audit:
+    name: pip-audit (Dependency Scan)
+    runs-on: ubuntu-latest
+ 
+    permissions:
+      contents: read
+ 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+ 
+      - name: Install pip-audit
+        run: pip install pip-audit
+ 
+      - name: Run pip-audit
+        # Scans requirements.txt directly — no need to install the deps.
+        # --desc adds the CVE description to the output for context.
+        # Exits with code 1 if any vulnerability is found — fails the check.
+        run: pip-audit -r requirements.txt --desc
+ 
+  # ── Job 5: Bandit — Python-specific security linter ───────────────────
+  # Purpose-built for Python; catches issues CodeQL misses:
+  # weak crypto (md5/sha1), subprocess shell=True, pickle deserialization,
+  # insecure random, Flask debug=True in production, assert in auth, etc.
+  # Maintained by PyCQA (Python Code Quality Authority).
+  bandit:
+    name: Bandit (Python Security Lint)
+    runs-on: ubuntu-latest
+ 
+    permissions:
+      security-events: write
+      contents: read
+ 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+ 
+      - name: Install Bandit
+        run: pip install bandit[sarif]
+ 
+      - name: Run Bandit
+        # -r = recursive scan of the whole repo.
+        # -ll = report only medium and high severity (reduces noise).
+        # -o + -f sarif = output as SARIF for GitHub Security tab.
+        # || true prevents the step from failing before SARIF is uploaded.
+        run: bandit -r . -ll -o bandit-results.sarif -f sarif || true
+ 
+      - name: Upload Bandit SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit
+ 
+  # ── Job 6: Trivy — Container image + filesystem vulnerability scan ─────
+  # Scans the Docker image built from the Dockerfile for:
+  #   - OS-level CVEs inside the base image (apt packages, libs)
+  #   - Python dependency CVEs (cross-checks requirements.txt)
+  #   - Misconfigurations and embedded secrets in the image layers
+  # Hadolint only lints Dockerfile syntax — Trivy scans what's *inside*.
+  # Free and open-source by Aqua Security.
+  trivy:
+    name: Trivy (Container Scan)
+    runs-on: ubuntu-latest
+ 
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+ 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+ 
+      - name: Build Docker image
+        # Build locally so Trivy can scan it — image never gets pushed.
+        run: docker build -t librecrawl:scan .
+ 
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: librecrawl:scan
+          format: sarif
+          output: trivy-results.sarif
+          # CRITICAL and HIGH only — reduces noise, still catches real issues.
+          severity: CRITICAL,HIGH
+          # Don't fail on unfixed vulnerabilities (no patch available yet).
+          # Remove this line to fail on ALL findings including unfixable ones.
+          ignore-unfixed: true
+ 
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+ 
+  # ── Job 7: OWASP Dependency-Check — Deep SCA with JS binary analysis ──
+  # Goes deeper than pip-audit by also scanning the web/ folder for
+  # JavaScript libraries bundled statically (no package.json needed).
+  # Detects vulnerable JS versions embedded directly in HTML/JS files —
+  # relevant because LibreCrawl serves a vanilla JS frontend from web/.
+  # Free and open-source by OWASP.
+  dependency-check:
+    name: OWASP Dependency-Check
+    runs-on: ubuntu-latest
+ 
+    permissions:
+      security-events: write
+      contents: read
+ 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+ 
+      - name: Run OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: "LibreCrawl"
+          path: "."
+          format: SARIF
+          # Fail the build if any CVSS score >= 7 (High or Critical).
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+ 
+      - name: Upload Dependency-Check SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+          category: dependency-check
