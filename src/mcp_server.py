@@ -31,10 +31,9 @@ def explain_issue(url: str, issue: str, category: str, details: str) -> dict:
 def check_existing_tickets(url: str, issue: str, category: str, details: str) -> dict:
     """Checks if there are existing tickets for the given issue ID. Returns a list of tickets if they exist."""
     response = requests.post(f"{BASE_URL}/api/devops_tickets/check", json={
-        "url": url,
-        "issue": issue,
-        "category": category,
-        "details": details
+        "pairs": [{
+            "url": url,
+            "issue": issue,}]
     })
     return response.json()
 
@@ -56,7 +55,7 @@ def create_devops_ticket(url: str, issue: str, category: str, issue_type: str, a
 @mcp.tool()
 def probe_urls(issues: list) -> dict:
     """Probes a list of URLs to check their HTTP status codes and returns the results."""
-    response = requests.post(f"{BASE_URL}/api/probe_http_errors", json={"urls": urls})
+    response = requests.post(f"{BASE_URL}/api/probe_http_errors", json={"issues" : issues)
     return response.json()
 
 if __name__ == "__main__":

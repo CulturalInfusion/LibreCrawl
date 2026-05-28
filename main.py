@@ -1809,6 +1809,50 @@ def devops_features():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+_agent_state = {}
+
+@app.route("/api/agent/start_workflow", methods=['POST'])
+def start_workflow():
+    global _agent_state
+    data = request.get_json()
+    _agent_state["url"] = data.get("url")
+    _agent_state["project"] = data.get("project")
+    _agent_state["feature"] = data.get("feature")
+    _agent_state["status"] = "Workflow started"
+    return jsonify({'success': True})
+
+@app.route("/api/agent/workflow_trigger", methods=['GET'])
+def workflow_trigger():
+    global _agent_state
+    if _agent_state.get("status") != "Workflow started":
+        return jsonify({'success': False, 'error': 'No active workflow'}), 400
+    
+    _agent_state["status"] = "Crawling"
+
+    return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature")})
+
+@app.route("/api/agent/triage", methods=['POST'])
+def agent_triage():
+    global _agent_state
+    data = request.get_json()
+    _agent_state["triage"] = data.get("issues", [])
+    _agent_state["status"] = "Triage ready"
+    return jsonify({'success': True})
+
+@app.route("/api/agent/triage", methods=['GET'])
+def get_triage():
+    global _agent_state
+    if _agent_state.get("status") != "Triage ready":
+        return jsonify({'success': False, 'error': 'Triage not ready'}), 400
+    return jsonify({'success': True, 'issues': _agent_state.get("triage", [])})
+
+@app.route("/api/agent/approval", methods=['POST'])
+def agent_approval():
+    global _agent_state
+    data = request.get_json()
+    _agent_state["approval"] = data.get("approval", [])
+    _agent_state["status"] = "Approval received"
+    return jsonify({'success': True})
 
 def main():
     import signal
