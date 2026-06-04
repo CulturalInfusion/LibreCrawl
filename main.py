@@ -18,6 +18,7 @@ from flask_compress import Compress
 from functools import wraps
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
+from src.agents.triage_agent import run_agentic as run_triage_agent
 from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, create_magic_link, verify_magic_link
 from src.email_service import send_verification_email, send_welcome_email, send_magic_link_email
 
@@ -25,13 +26,21 @@ from src.email_service import send_verification_email, send_welcome_email, send_
 from dotenv import load_dotenv
 load_dotenv()
 
-# OpenAI client for AI-powered issue explanations
+# OpenAI client 
 try:
     from openai import OpenAI
     openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 except ImportError:
     openai_client = None
-    print("Warning: openai package not installed. AI explanations will be unavailable.")
+    print("Warning: openai package not installed.")
+
+# Anthropic client 
+try:
+    from anthropic import Anthropic
+    anthropic_client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+except ImportError:
+    anthropic_client = None
+    print("Warning: anthropic package not installed.")
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LibreCrawl - SEO Spider Tool')
@@ -1530,19 +1539,12 @@ CATEGORY_ROLE_MAP = {
 def explain_issue():
     """Generate AI-powered explanation and fix for a crawl issue using OpenAI"""
     try:
-        # Check if OpenAI client is available
-        if openai_client is None:
+        # Check if OpenAI and Anthropic client is available
+        provider = 'anthropic' if anthropic_client else 'openai' if openai_client else None
+        if provider is None:
             return jsonify({
                 'success': False,
-                'error': 'OpenAI package not installed. Run: pip install openai>=1.0.0'
-            }), 400
-
-        # Check if API key is configured
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            return jsonify({
-                'success': False,
-                'error': 'OPENAI_API_KEY not configured in .env file'
+                'error': 'No AI provider configured'
             }), 400
 
         data = request.get_json()
@@ -1587,10 +1589,19 @@ Provide a JSON response with exactly this structure:
 Keep the explanation concise but specific to this URL. Use SEMRush-style actionable language."""
 
         # Call OpenAI API
-        response = openai_client.chat.completions.create(
+        if provider == 'anthropic':
+            response = anthropic_client.messages.create(
+                model='claude-haiku-4-5-20251001',
+                system='You are an SEO expert. Always respond with valid JSON.',
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=500,
+            )
+        else:
+        # Call Anthropic API
+            response = openai_client.chat.completions.create(
             model='gpt-3.5-turbo',
             messages=[
-                {'role': 'system', 'content': 'You are an SEO expert. Always respond with valid JSON.'},
+                {'role': 'system', 'content': 'You are an SEO expert, specialized in WordPress websites. The URLs you crawl are Wordpress sites so all fix guidance must  reference WordPress-specific tooling: wp-admin, plugins, themes. Do not give generic CMS advice. Always respond with valid JSON.'},
                 {'role': 'user', 'content': prompt}
             ],
             max_tokens=500,
@@ -1599,20 +1610,31 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
         )
 
         # Parse response
-        ai_response = json.loads(response.choices[0].message.content)
+        if provider == 'openai':
+            ai_response = json.loads(response.choices[0].message.content)
+        else:
+            text = response.content[0].text
+            ai_response = json.loads(text[text.find('{'):text.rfind('}')+1])
 
-        # Log token usage (optional, for cost tracking)
-        usage = response.usage
-        print(f"AI Explain - Tokens used: {usage.total_tokens} (in: {usage.prompt_tokens}, out: {usage.completion_tokens})")
+        # Log token usage
+        if provider == 'anthropic':
+            tokens = response.usage.input_tokens + response.usage.output_tokens
+        else:
+            tokens = response.usage.total_tokens
+        print(f"AI Explain - Tokens used: {tokens}")
+
+        how_to_fix = ai_response.get('how_to_fix', '')
+        if isinstance(how_to_fix, list):
+            how_to_fix = '• ' + '\n• '.join(str(item).strip() for item in how_to_fix if item)
 
         return jsonify({
             'success': True,
             'explanation': ai_response.get('explanation', ''),
-            'how_to_fix': ai_response.get('how_to_fix', ''),
+            'how_to_fix': how_to_fix,
             'priority': ai_response.get('priority', 'medium'),
             'role': ai_response.get('role', ''),
-            'tokens_used': usage.total_tokens,
-            'model': 'gpt-3.5-turbo'
+            'tokens_used': tokens,
+            'model': 'claude-haiku-4-5-20251001' if provider == 'anthropic' else 'gpt-3.5-turbo'
         })
 
     except Exception as e:
@@ -1822,10 +1844,17 @@ _agent_state = {}
 def start_workflow():
     global _agent_state
     data = request.get_json()
-    _agent_state["url"] = data.get("url")
+    _agent_state["url"]     = data.get("url")
     _agent_state["project"] = data.get("project")
     _agent_state["feature"] = data.get("feature")
-    _agent_state["status"] = "Workflow started"
+    _agent_state["status"]  = "Workflow started"
+    _agent_state["issues"]  = data.get("issues", [])
+    _agent_state["results"] = None
+
+    issues = _agent_state["issues"]
+    thread = threading.Thread(target=run_triage_agent, args=(issues,), daemon=True)
+    thread.start()
+
     return jsonify({'success': True})
 
 @app.route("/api/agent/workflow_trigger", methods=['GET'])
@@ -1836,7 +1865,7 @@ def workflow_trigger():
     
     _agent_state["status"] = "Crawling"
 
-    return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature")})
+    return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature"), 'issues': _agent_state.get("issues", [])})
 
 @app.route("/api/agent/triage", methods=['POST'])
 def agent_triage():
@@ -1876,13 +1905,35 @@ def create_bulk_tickets():
     project   = _agent_state.get("project", "")
     parent_id = _agent_state.get("feature", "")
 
+    import base64 as _b64
+    from src.crawl_db import get_tickets_for_issues
+
     created = []
     errors  = []
 
-    for issue in approved:
+    # Generate cache_keys matching the JS formula used by the plugin:
+    # 'ai_' + btoa(unescape(encodeURIComponent(url+'|'+issue))).replace(/[=+/]/g, '')
+    # Python equivalent: base64(utf-8 bytes), strip =, +, /
+    def _cache_key(u, iss):
+        raw = (u + '|' + iss).encode('utf-8')
+        return 'ai_' + _b64.b64encode(raw).decode('ascii').replace('=', '').replace('+', '').replace('/', '')
+
+    pairs    = [{'url': i.get('url',''), 'issue': i.get('issue',''), 'cache_key': _cache_key(i.get('url',''), i.get('issue',''))} for i in approved]
+    existing = get_tickets_for_issues(pairs)
+
+    for i, issue in enumerate(approved):
+        url        = issue.get("url", "")
+        issue_name = issue.get("issue", "")
+        ck         = pairs[i]['cache_key']
+
+        if ck in existing:
+            t = existing[ck]
+            created.append({'ticket_id': t.get('ticket_id'), 'ticket_url': t.get('ticket_url'), 'title': issue_name, 'skipped': True})
+            continue
+
         success, result = _create_single_ticket(
-            issue.get("url", ""),
-            issue.get("issue", ""),
+            url,
+            issue_name,
             issue.get("category", ""),
             issue.get("type", "warning"),
             issue.get("explanation", ""),
@@ -1896,9 +1947,80 @@ def create_bulk_tickets():
         if success:
             created.append(result)
         else:
-            errors.append({**result, 'url': issue.get("url", "")})
+            errors.append({**result, 'url': url})
 
+    _agent_state["results"] = {"created": created, "errors": errors}
+    _agent_state["status"]  = "Completed"
     return jsonify({'success': True, 'created': created, 'errors': errors})
+
+@app.route("/api/agent/results", methods=['GET'])
+def get_results():
+    global _agent_state
+    if _agent_state.get("status") != "Completed":
+        return jsonify({'ready': False})
+    return jsonify({'ready': True, 'results': _agent_state.get("results", {})})
+
+@app.route("/api/agent/chat", methods=['POST'])
+def agent_chat():
+    provider = 'anthropic' if anthropic_client else 'openai' if openai_client else None
+    if provider is None:
+        return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
+
+    data    = request.get_json()
+    message = data.get('message', '')
+    issues  = data.get('issues', [])
+
+    issue_lines = '\n'.join(
+        f"{iss.get('issue','')} | {iss.get('url','')} | priority:{iss.get('priority','?')} | type:{iss.get('type','')}"
+        for iss in issues
+    )
+
+    prompt = f"""You are helping a developer triage SEO audit issues before creating tickets.
+
+Issue list (issue | url | priority | type):
+{issue_lines}
+
+User request: {message}
+
+First, write 1-2 sentences summarising what you found and listing the matched issue names.
+Then output a JSON block with the exact issue name and url for each match:
+{{"matches": [{{"issue": "exact issue name", "url": "exact url"}}]}}
+
+If all issues should be shown, include them all. Copy issue names and URLs exactly as written above. Always include the JSON block."""
+
+    try:
+        if provider == 'anthropic':
+            resp = anthropic_client.messages.create(
+                model='claude-haiku-4-5-20251001',
+                system='You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.',
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=1500,
+            )
+            text = resp.content[0].text
+        else:
+            resp = openai_client.chat.completions.create(
+                model='gpt-3.5-turbo',
+                messages=[
+                    {'role': 'system', 'content': 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'},
+                    {'role': 'user', 'content': prompt}
+                ],
+                max_tokens=1500,
+            )
+            text = resp.choices[0].message.content
+
+        json_start = text.rfind('{')
+        json_end   = text.rfind('}') + 1
+        match_data = json.loads(text[json_start:json_end])
+        reply      = text[:json_start].strip()
+
+        return jsonify({
+            'success': True,
+            'reply': reply,
+            'matches': match_data.get('matches', [])
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 def main():
     import signal
