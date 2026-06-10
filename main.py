@@ -2020,7 +2020,8 @@ If all issues should be shown, include them all. Copy issue names and URLs exact
         })
 
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        print(f"[Chat] Error: {e}")
+        return jsonify({'success': False, 'error': 'Chat request failed'}), 500
 
 def main():
     import signal
