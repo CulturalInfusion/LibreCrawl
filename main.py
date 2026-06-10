@@ -2008,10 +2008,15 @@ If all issues should be shown, include them all. Copy issue names and URLs exact
             )
             text = resp.choices[0].message.content
 
-        json_start = text.rfind('{')
-        json_end   = text.rfind('}') + 1
-        match_data = json.loads(text[json_start:json_end])
-        reply      = text[:json_start].strip()
+        json_match = re.search(r'\{\s*"matches"\s*:', text)
+        if json_match:
+            json_start = json_match.start()
+            json_end   = text.rfind('}') + 1
+            match_data = json.loads(text[json_start:json_end])
+            reply      = text[:json_start].strip()
+        else:
+            match_data = {'matches': []}
+            reply      = text.strip()
 
         return jsonify({
             'success': True,
