@@ -19,6 +19,7 @@ from functools import wraps
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
 from src.agents.triage_agent import run_agentic as run_triage_agent
+from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL
 from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, create_magic_link, verify_magic_link
 from src.email_service import send_verification_email, send_welcome_email, send_magic_link_email
 
@@ -26,21 +27,29 @@ from src.email_service import send_verification_email, send_welcome_email, send_
 from dotenv import load_dotenv
 load_dotenv()
 
-# OpenAI client 
-try:
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-except ImportError:
-    openai_client = None
-    print("Warning: openai package not installed.")
+# OpenAI client
+openai_client = None
+openai_api_key = (os.getenv('OPENAI_API_KEY') or '').strip()
+if openai_api_key:
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=openai_api_key)
+    except ImportError:
+        print("Warning: openai package not installed.")
+    except Exception:
+        print("Warning: OpenAI client could not be initialized.")
 
-# Anthropic client 
-try:
-    from anthropic import Anthropic
-    anthropic_client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
-except ImportError:
-    anthropic_client = None
-    print("Warning: anthropic package not installed.")
+# Anthropic client
+anthropic_client = None
+anthropic_api_key = (os.getenv('ANTHROPIC_API_KEY') or '').strip()
+if anthropic_api_key:
+    try:
+        from anthropic import Anthropic
+        anthropic_client = Anthropic(api_key=anthropic_api_key)
+    except ImportError:
+        print("Warning: anthropic package not installed.")
+    except Exception:
+        print("Warning: Anthropic client could not be initialized.")
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LibreCrawl - SEO Spider Tool')
@@ -1540,7 +1549,7 @@ def explain_issue():
     """Generate AI-powered explanation and fix for a crawl issue using OpenAI"""
     try:
         # Check if OpenAI and Anthropic client is available
-        provider = 'anthropic' if anthropic_client else 'openai' if openai_client else None
+        provider = get_provider()
         if provider is None:
             return jsonify({
                 'success': False,
@@ -1928,7 +1937,14 @@ def create_bulk_tickets():
 
         if ck in existing:
             t = existing[ck]
-            created.append({'ticket_id': t.get('ticket_id'), 'ticket_url': t.get('ticket_url'), 'title': issue_name, 'skipped': True})
+            created.append({
+                'ticket_id': t.get('ticket_id'),
+                'ticket_url': t.get('ticket_url'),
+                'title': issue_name,
+                'skipped': True,
+                'agent3_status': 'skipped',
+                'agent3_reason': 'ticket already exists'
+            })
             continue
 
         success, result = _create_single_ticket(
@@ -1945,6 +1961,22 @@ def create_bulk_tickets():
             user_id=session.get('user_id')
         )
         if success:
+            from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
+            fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
+            result['agent3_status'] = fix_result.get('status')
+            result['agent3_reason'] = fix_result.get('reason', '')
+            result['agent3_object_id'] = fix_result.get('object_id')
+            result['agent3_object_type'] = fix_result.get('object_type')
+
+            if fix_result['status'] == 'fixed':
+                qa_state = os.getenv('AZURE_QA_STATE', 'QA')
+                result['agent3_qa_state'] = qa_state
+                result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
+                if fix_result.get('caveat'):
+                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
+            elif fix_result['status'] == 'deferred':
+                result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
+
             created.append(result)
         else:
             errors.append({**result, 'url': url})
@@ -1960,9 +1992,30 @@ def get_results():
         return jsonify({'ready': False})
     return jsonify({'ready': True, 'results': _agent_state.get("results", {})})
 
+@app.route("/api/agent/provider_options", methods=['GET'])
+def provider_options():
+    return jsonify({
+        'anthropic_available': bool(os.getenv('ANTHROPIC_API_KEY')),
+        'openai_available': bool(os.getenv('OPENAI_API_KEY')),
+        'current': get_provider()
+    })
+
+@app.route("/api/agent/set_provider", methods=['POST'])
+def set_provider():
+    data = request.get_json()
+    provider = data.get('provider')
+    if provider not in ('anthropic', 'openai'):
+        return jsonify({'success': False, 'error': 'Invalid provider'}), 400
+    if provider == 'anthropic' and not os.getenv('ANTHROPIC_API_KEY'):
+        return jsonify({'success': False, 'error': 'Anthropic API key not configured'}), 400
+    if provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
+        return jsonify({'success': False, 'error': 'OpenAI API key not configured'}), 400
+    set_provider_override(provider)
+    return jsonify({'success': True, 'provider': provider})
+
 @app.route("/api/agent/chat", methods=['POST'])
 def agent_chat():
-    provider = 'anthropic' if anthropic_client else 'openai' if openai_client else None
+    provider = get_provider()
     if provider is None:
         return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
 
@@ -1991,20 +2044,20 @@ If all issues should be shown, include them all. Copy issue names and URLs exact
     try:
         if provider == 'anthropic':
             resp = anthropic_client.messages.create(
-                model='claude-haiku-4-5-20251001',
+                model=ANTHROPIC_MODEL,
                 system='You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.',
                 messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=1500,
+                max_tokens=4096,
             )
             text = resp.content[0].text
         else:
             resp = openai_client.chat.completions.create(
-                model='gpt-3.5-turbo',
+                model=OPENAI_MODEL,
                 messages=[
                     {'role': 'system', 'content': 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'},
                     {'role': 'user', 'content': prompt}
                 ],
-                max_tokens=1500,
+                max_tokens=4096,
             )
             text = resp.choices[0].message.content
 

@@ -32,6 +32,19 @@ services:
       # - SMTP_FROM_NAME=${SMTP_FROM_NAME}
       # Add this for correct links in the verification emails
       # - MAIN_APP_URL=${MAIN_APP_URL}
+      # AI / Azure integrations are optional; app startup must not require them.
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - AZURE_DEVOPS_ORG=${AZURE_DEVOPS_ORG}
+      - AZURE_DEVOPS_PAT=${AZURE_DEVOPS_PAT}
+      - AZURE_AREA_SUFFIX=${AZURE_AREA_SUFFIX}
+      - AZURE_DEVOPS_SM_EMAIL=${AZURE_DEVOPS_SM_EMAIL}
+      - AZURE_DEVOPS_PROCESS=${AZURE_DEVOPS_PROCESS}
+      - AZURE_QA_STATE=${AZURE_QA_STATE:-QA}
+      # Agent 3 WordPress integration. Leave blank unless a real staging/sandbox
+      # site is configured for this container to reach.
+      - WP_USERNAME=${WP_USERNAME}
+      - WP_APP_PASSWORD=${WP_APP_PASSWORD}
     restart: unless-stopped
     command: >
       sh -c "
@@ -52,4 +65,3 @@ services:
 
     # Increase shared memory size for Chrome to prevent crashes
     shm_size: '2gb'
-

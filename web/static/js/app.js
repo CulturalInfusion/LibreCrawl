@@ -62,6 +62,9 @@ async function initializeApp() {
     // Load Azure DevOps project/board selectors if configured
     loadDevopsProjects();
 
+    // Load AI provider selector if both providers are configured
+    loadProviderOptions();
+
     // DEBUG: Check sessionStorage
     console.log('DEBUG: Checking sessionStorage force_ui_refresh:', sessionStorage.getItem('force_ui_refresh'));
 
@@ -2298,6 +2301,34 @@ function renderIssueRow(row, issue, index) {
         <td style="word-break: break-word;" title="${issue.details}">${issue.details}</td>
     `;
 }
+
+// ── AI provider selector ─────────────────────────────────────────────────────
+
+async function loadProviderOptions() {
+    const selector = document.getElementById('provider-selector');
+    const select   = document.getElementById('provider-select');
+    try {
+        const resp = await fetch('/api/agent/provider_options');
+        const data = await resp.json();
+        if (data.anthropic_available && data.openai_available) {
+            select.value = data.current || 'anthropic';
+            selector.style.display = 'flex';
+        }
+    } catch (_) {}
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const select = document.getElementById('provider-select');
+    if (select) {
+        select.addEventListener('change', async () => {
+            await fetch('/api/agent/set_provider', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ provider: select.value })
+            });
+        });
+    }
+});
 
 // ── Azure DevOps project / feature selectors ────────────────────────────────
 
