@@ -1653,7 +1653,7 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             'error': str(e)
         }), 500
 
-def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_how_to_fix, ai_priority, ai_role, project, parent_id, user_id=None):
+def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_how_to_fix, ai_priority, ai_role, project, parent_id, assignee=None, user_id=None):
     """Shared ticket creation logic used by both the single-issue route and bulk agent route."""
     import base64
     from urllib.parse import urlparse, quote
@@ -1715,7 +1715,7 @@ def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_h
         {'op': 'add', 'path': '/fields/System.Title',                             'value': title},
         {'op': 'add', 'path': '/fields/System.Description',                       'value': description_html},
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.Priority',           'value': az_priority},
-        {'op': 'add', 'path': '/fields/System.AssignedTo',                        'value': sm_email},
+        {'op': 'add', 'path': '/fields/System.AssignedTo',                        'value': assignee or sm_email},
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', 'value': ac_html},
         {'op': 'add', 'path': '/fields/System.AreaPath',                          'value': f'{project}\\{os.environ.get("AZURE_AREA_SUFFIX")}'},
         {'op': 'add', 'path': '/relations/-', 'value': {
@@ -1752,6 +1752,7 @@ def create_devops_ticket():
     ai_fix      = data.get('ai_how_to_fix', '')
     ai_priority = data.get('ai_priority', 'medium')
     ai_role     = data.get('ai_role', '')
+    assignee    = data.get('assignee_override') or None
 
     project   = data.get('project_override') or os.getenv('AZURE_DEVOPS_PROJECT', '')
     parent_id = data.get('parent_id_override') or os.getenv('AZURE_DEVOPS_PARENT_ID', '')
@@ -1763,7 +1764,7 @@ def create_devops_ticket():
 
     success, result = _create_single_ticket(
         url, issue, category, issue_type, ai_exp, ai_fix, ai_priority, ai_role,
-        project, parent_id, user_id=session.get('user_id')
+        project, parent_id, assignee=assignee, user_id=session.get('user_id')
     )
     if success:
         return jsonify({'success': True, **result})
@@ -1846,6 +1847,56 @@ def devops_features():
         return jsonify({'success': True, 'features': features})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/devops/identities', methods=['GET'])
+@login_required
+def devops_identities():
+    org   = os.getenv('AZURE_DEVOPS_ORG')
+    pat   = os.getenv('AZURE_DEVOPS_PAT')
+    query = request.args.get('q', '').strip()
+    if not org or not pat:
+        return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG or AZURE_DEVOPS_PAT not configured'}), 400
+    if not query:
+        return jsonify({'success': True, 'members': []})
+
+    import base64
+    token   = base64.b64encode(f':{pat}'.encode()).decode()
+    headers = {
+        'Authorization': f'Basic {token}',
+        'Content-Type': 'application/json',
+        # IdentityPicker is an older internal API surface — api-version goes in the
+        # Accept header, not as a query param like every other Azure call in this
+        # file. Exact value verified via DevTools against a real org.
+        'Accept': 'application/json;api-version=5.0-preview.1;excludeUrls=true;enumsAsNumbers=true;msDateFormat=true;noArrayWrap=true',
+    }
+    url  = f'https://dev.azure.com/{org}/_apis/IdentityPicker/Identities'
+    body = {
+        'query': query,
+        'identityTypes': ['user', 'servicePrincipal'],
+        'operationScopes': ['ims', 'source'],
+        'options': {'MinResults': 5, 'MaxResults': 20},
+        'properties': ['DisplayName', 'SamAccountName', 'Active', 'SubjectDescriptor', 'Mail'],
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        members = []
+        for result in data.get('results', []):
+            for identity in result.get('identities', []):
+                if identity.get('active') is False:
+                    continue
+                email = identity.get('mail') or identity.get('signInAddress') or identity.get('samAccountName', '')
+                if email:
+                    members.append({'email': email, 'name': identity.get('displayName', email)})
+        return jsonify({'success': True, 'members': members})
+    except requests.exceptions.HTTPError:
+        return jsonify({'success': False, 'error': f'Azure DevOps {resp.status_code}: {resp.text}'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 _agent_state = {}
 
@@ -1958,24 +2009,31 @@ def create_bulk_tickets():
             issue.get("role", ""),
             project,
             parent_id,
+            assignee=issue.get("assignee") or None,
             user_id=session.get('user_id')
         )
         if success:
-            from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
-            fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
-            result['agent3_status'] = fix_result.get('status')
-            result['agent3_reason'] = fix_result.get('reason', '')
-            result['agent3_object_id'] = fix_result.get('object_id')
-            result['agent3_object_type'] = fix_result.get('object_type')
+            try:
+                from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
+                fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
+                result['agent3_status'] = fix_result.get('status')
+                result['agent3_reason'] = fix_result.get('reason', '')
+                result['agent3_object_id'] = fix_result.get('object_id')
+                result['agent3_object_type'] = fix_result.get('object_type')
 
-            if fix_result['status'] == 'fixed':
-                qa_state = os.getenv('AZURE_QA_STATE', 'QA')
-                result['agent3_qa_state'] = qa_state
-                result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
-                if fix_result.get('caveat'):
-                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
-            elif fix_result['status'] == 'deferred':
-                result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
+                if fix_result['status'] == 'fixed':
+                    qa_state = os.getenv('AZURE_QA_STATE', 'QA')
+                    result['agent3_qa_state'] = qa_state
+                    result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
+                    if fix_result.get('caveat'):
+                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
+                elif fix_result['status'] == 'deferred':
+                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
+            except Exception as e:
+                # Ticket was already created in Azure above — don't let a downstream
+                # Agent 3 failure (e.g. WordPress unreachable) drop the whole batch.
+                result['agent3_status'] = 'error'
+                result['agent3_reason'] = f'Agent 3 failed: {e}'
 
             created.append(result)
         else:
