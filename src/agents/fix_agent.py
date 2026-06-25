@@ -1,7 +1,3 @@
-# TODO: this module uses print() for progress visibility (`docker logs -f librecrawl`).
-# Review before merging — follow the str(e) handling pattern from PR9-CODEQL-FIXPLAN.md
-# (don't let raw exception text leak into anything client-facing).
-
 import os
 import base64
 import requests
@@ -25,7 +21,7 @@ def _confirm_rendered(url, expected):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
-        return {k: f'could not re-fetch page: {e}' for k in expected}
+        return {'Could not fetch page'}
 
     missing = {}
     for name, value in expected.items():
@@ -266,11 +262,7 @@ def run_fix(ticket):
 
     if ' Redirect' in issue:
         print(f"[Agent 3] Tracing redirect chain for {url}...")
-        try:
-            final_url = _redirect_confidence_check(url)
-        except Exception as e:
-            print(f"[Agent 3] Could not trace redirect chain for {url}: {e}")
-            final_url = None
+        final_url = _redirect_confidence_check(url)
         if not final_url:
             reason = _defer_reason(issue)
             print(f"[Agent 3] Redirect chain isn't a safe single-hop same-domain collapse — deferring. {reason}")
@@ -278,11 +270,7 @@ def run_fix(ticket):
 
         print(f"[Agent 3] Safe to collapse: {url} -> {final_url}")
         namespaces = probe_site(url)['namespaces']
-        try:
-            plugin_slug = decide_required_plugin(issue, namespaces)
-        except Exception as e:
-            print(f"[Agent 3] decide_required_plugin failed: {e}")
-            plugin_slug = 'none'
+        plugin_slug = decide_required_plugin(issue, namespaces)
         caveat = None
         if plugin_slug == 'redirection' and 'redirection/v1' not in namespaces:
             print(f"[Agent 3] Redirection plugin not found on {url} — attempting to install '{plugin_slug}'...")
@@ -292,7 +280,7 @@ def run_fix(ticket):
                 caveat = f"Installed and activated '{plugin_slug}' on this site to apply this fix — please confirm it's appropriate."
             except Exception as e:
                 print(f"[Agent 3] Could not auto-install '{plugin_slug}': {e}")
-                return {'status': 'deferred', 'reason': "Redirection plugin not found and auto-install failed — see server logs for detail.", 'issue': issue, 'url': url}
+                return {'status': 'deferred', 'reason': f"Redirection plugin not found and auto-install failed ({e}).", 'issue': issue, 'url': url}
 
         try:
             create_redirect_rule(url, urlparse(url).path, final_url)
@@ -328,11 +316,7 @@ def run_fix(ticket):
     print(f"[Agent 3] Found {object_type} ID {object_id}.")
 
     namespaces = probe_site(url)['namespaces']
-    try:
-        plugin_slug = decide_required_plugin(issue, namespaces)
-    except Exception as e:
-        print(f"[Agent 3] decide_required_plugin failed: {e}")
-        plugin_slug = 'none'
+    plugin_slug = decide_required_plugin(issue, namespaces)
     caveat = None
     if plugin_slug == 'seo-by-rank-math' and 'rankmath/v1' not in namespaces:
         print(f"[Agent 3] RankMath not found on {url} — attempting to install '{plugin_slug}'...")
@@ -342,7 +326,7 @@ def run_fix(ticket):
             caveat = f"Installed and activated '{plugin_slug}' on this site to apply this fix — please confirm it's appropriate."
         except Exception as e:
             print(f"[Agent 3] Could not auto-install '{plugin_slug}': {e}")
-            return {'status': 'deferred', 'reason': "RankMath not found and auto-install failed — see server logs for detail.", 'issue': issue, 'url': url}
+            return {'status': 'deferred', 'reason': f"RankMath not found and auto-install failed ({e}).", 'issue': issue, 'url': url}
 
     meta_dict = fix_fn(ticket)
     print(f"[Agent 3] Applying fix: updating {list(meta_dict.keys())} on {object_type} {object_id}...")
