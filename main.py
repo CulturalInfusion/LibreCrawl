@@ -65,6 +65,8 @@ DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'ye
 SKIP_AUTH = args.dangerously_skip_auth or os.getenv('DANGEROUSLY_SKIP_AUTH', '').lower() in ('true', '1', 'yes')
 ALLOWED_EMAIL_DOMAIN = os.getenv('ALLOWED_EMAIL_DOMAIN', '')
 MAIN_APP_URL = os.getenv('MAIN_APP_URL', 'http://localhost:5000').rstrip('/')
+ANTHROPIC_EXPLAIN_MODEL = os.getenv('ANTHROPIC_EXPLAIN_MODEL', 'claude-haiku-4-5-20251001')
+OPENAI_EXPLAIN_MODEL = os.getenv('OPENAI_EXPLAIN_MODEL', 'gpt-3.5-turbo')
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
@@ -1591,7 +1593,7 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
         # Call OpenAI API
         if provider == 'anthropic':
             response = anthropic_client.messages.create(
-                model='claude-haiku-4-5-20251001',
+                model=ANTHROPIC_EXPLAIN_MODEL,
                 system='You are an SEO expert. Always respond with valid JSON.',
                 messages=[{'role': 'user', 'content': prompt}],
                 max_tokens=500,
@@ -1599,7 +1601,7 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
         else:
         # Call Anthropic API
             response = openai_client.chat.completions.create(
-            model='gpt-3.5-turbo',
+            model=OPENAI_EXPLAIN_MODEL,
             messages=[
                 {'role': 'system', 'content': 'You are an SEO expert, specialized in WordPress websites. The URLs you crawl are Wordpress sites so all fix guidance must  reference WordPress-specific tooling: wp-admin, plugins, themes. Do not give generic CMS advice. Always respond with valid JSON.'},
                 {'role': 'user', 'content': prompt}
@@ -1634,7 +1636,7 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             'priority': ai_response.get('priority', 'medium'),
             'role': ai_response.get('role', ''),
             'tokens_used': tokens,
-            'model': 'claude-haiku-4-5-20251001' if provider == 'anthropic' else 'gpt-3.5-turbo'
+            'model': ANTHROPIC_EXPLAIN_MODEL if provider == 'anthropic' else OPENAI_EXPLAIN_MODEL
         })
 
     except Exception as e:
@@ -1991,7 +1993,7 @@ If all issues should be shown, include them all. Copy issue names and URLs exact
     try:
         if provider == 'anthropic':
             resp = anthropic_client.messages.create(
-                model='claude-haiku-4-5-20251001',
+                model=ANTHROPIC_EXPLAIN_MODEL,
                 system='You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.',
                 messages=[{'role': 'user', 'content': prompt}],
                 max_tokens=1500,
@@ -1999,7 +2001,7 @@ If all issues should be shown, include them all. Copy issue names and URLs exact
             text = resp.content[0].text
         else:
             resp = openai_client.chat.completions.create(
-                model='gpt-3.5-turbo',
+                model=OPENAI_EXPLAIN_MODEL,
                 messages=[
                     {'role': 'system', 'content': 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'},
                     {'role': 'user', 'content': prompt}

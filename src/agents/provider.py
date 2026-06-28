@@ -1,10 +1,12 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # Reasoning-quality models for the agentic loop.
 # These are deliberately higher-tier than explain_issue (Haiku/GPT-3.5)
 # because the loop needs to make multi-step decisions, not just generate text.
-ANTHROPIC_MODEL = 'claude-sonnet-4-6'
-OPENAI_MODEL    = 'gpt-4o'
+ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-6')
+OPENAI_MODEL    = os.getenv('OPENAI_MODEL', 'gpt-4o')
 
 def get_provider():
     """Returns which AI provider is configured based on available API keys."""
