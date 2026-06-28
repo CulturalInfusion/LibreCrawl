@@ -209,12 +209,128 @@ LibreCrawlPlugin.register({
         container.innerHTML = `
             <div class="plugin-content" style="padding: 20px; overflow-y: auto; overflow-x: hidden; max-height: calc(100vh - 280px);">
                 ${this.renderHeader()}
+                ${this.renderAgentPanel(data)}
                 ${this.renderSummaryCards(issues, internalUrls, links)}
                 ${this.renderIssuesTable(issues)}
                 ${this.renderMetaTagMatrix(internalUrls)}
                 ${this.renderPerformanceAnalysis(internalUrls)}
             </div>
         `;
+
+        // Handler 1: Run Agent button
+        let _triageIssues = [];
+        const runBtn = container.querySelector('#agent-run-btn');
+        if (runBtn) {
+            runBtn.addEventListener('click', async () => {
+                const ctx = window.devopsContext || {};
+                const rootUrl = internalUrls.reduce((a, b) => a.url.length <= b.url.length ? a : b)?.url || '';
+
+                runBtn.disabled = true;
+                container.querySelector('#agent-idle').style.display = 'none';
+                container.querySelector('#agent-running').style.display = 'block';
+
+                await fetch('/api/agent/start_workflow', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: rootUrl, project: ctx.project || '', feature: ctx.parentId || '', issues: issues })
+                });
+
+                const poll = setInterval(async () => {
+                    const resp = await fetch('/api/agent/triage');
+                    if (resp.ok) {
+                        const result = await resp.json();
+                        if (result.success) {
+                            clearInterval(poll);
+                            _triageIssues = result.issues;
+                            container.querySelector('#agent-running').style.display = 'none';
+                            container.querySelector('#agent-triage').style.display = 'block';
+                            this.renderAgentChecklist(container, result.issues);
+                            this.appendChatMessage(container,
+                                `I've analysed ${result.issues.length} issues. Ask me to filter by priority, type, URL pattern, or anything else — then tick the ones you want to action.`,
+                                'agent');
+                        }
+                    }
+                }, 5000);
+            });
+        }
+
+        // Handler 2: Approve Selected button
+        const approveBtn = container.querySelector('#agent-approve-btn');
+        if (approveBtn) {
+            approveBtn.addEventListener('click', async () => {
+                const checked = Array.from(container.querySelectorAll('.triage-checkbox:checked'));
+                const approved = checked.map(cb => JSON.parse(cb.dataset.issue));
+
+                approveBtn.disabled = true;
+                approveBtn.textContent = '⏳ Submitting...';
+
+                await fetch('/api/agent/approval', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ approval: approved })
+                });
+
+                container.querySelector('#agent-triage').style.display = 'none';
+                container.querySelector('#agent-running').style.display = 'block';
+                container.querySelector('#agent-running p').textContent =
+                    `Creating tickets for ${approved.length} issue(s). Please wait...`;
+
+                const poll = setInterval(async () => {
+                    const resp = await fetch('/api/agent/results');
+                    if (!resp.ok) return;
+                    const result = await resp.json();
+                    if (result.ready) {
+                        clearInterval(poll);
+                        container.querySelector('#agent-running').style.display = 'none';
+                        container.querySelector('#agent-done').style.display = 'block';
+                        this.renderTicketResults(container, result.results);
+                    }
+                }, 3000);
+            });
+        }
+
+        // Handler 3: Chat send
+        const chatSend  = container.querySelector('#agent-chat-send');
+        const chatInput = container.querySelector('#agent-chat-input');
+        if (chatSend && chatInput) {
+            const sendMessage = async () => {
+                const msg = chatInput.value.trim();
+                if (!msg) return;
+                chatInput.value = '';
+                chatSend.disabled = true;
+
+                this.appendChatMessage(container, msg, 'user');
+                const thinkingEl = this.appendChatMessage(container, '...', 'agent');
+
+                try {
+                    const resp = await fetch('/api/agent/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        // trim to only the fields the route uses — avoids sending full explanation blobs
+                        body: JSON.stringify({
+                            message: msg,
+                            issues: _triageIssues.map(i => ({ url: i.url, issue: i.issue, priority: i.priority, type: i.type }))
+                        })
+                    });
+                    const result = await resp.json();
+                    if (thinkingEl) thinkingEl.remove();
+
+                    if (result.success) {
+                        this.appendChatMessage(container, result.reply, 'agent');
+                        this.filterChecklistByContent(container, result.matches, _triageIssues.length);
+                    } else {
+                        this.appendChatMessage(container, `Couldn't process that: ${result.error || 'unknown error'}`, 'agent');
+                    }
+                } catch (e) {
+                    if (thinkingEl) thinkingEl.remove();
+                    this.appendChatMessage(container, 'Request failed — please try again.', 'agent');
+                } finally {
+                    chatSend.disabled = false;
+                }
+            };
+            chatSend.addEventListener('click', sendMessage);
+            chatInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+        }
 
         // Attach filter event listeners (category + type + URL search)
         const categoryFilterSelect = container.querySelector('#pd-category-filter');
@@ -273,7 +389,7 @@ LibreCrawlPlugin.register({
 
                 let cleanedIssues = filteredIssues;
                 try {
-                    const probeResponse = await fetch('/api/probe_http_issues', {
+                    const probeResponse = await fetch('/api/probe_http_errors', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ issues: filteredIssues })
@@ -317,97 +433,6 @@ LibreCrawlPlugin.register({
                 document.body.removeChild(a);
             });
         }
-
-        // Attach "Ask AI" button event listeners with localStorage caching
-        const aiButtons = container.querySelectorAll('.ai-btn');
-        aiButtons.forEach(btn => {
-            btn.addEventListener('click', async (e) => {
-                e.preventDefault();
-                const url = btn.dataset.url;
-                const issue = btn.dataset.issue;
-                const category = btn.dataset.category;
-                const details = btn.dataset.details;
-                const cacheKey = btn.dataset.cacheKey;
-                const row = btn.closest('tr');
-                const responseDiv = row.querySelector(`.ai-response[data-cache-key="${cacheKey}"]`);
-                const staticFixDiv = row.querySelector('.static-fix');
-
-                if (!responseDiv) return;
-
-                // Check localStorage cache first
-                const cached = localStorage.getItem(cacheKey);
-                if (cached) {
-                    const cachedData = JSON.parse(cached);
-                    this.displayAIResponse(responseDiv, staticFixDiv, cachedData, btn);
-                    return;
-                }
-
-                // Show loading state
-                btn.disabled = true;
-                btn.innerHTML = '🤔 Thinking...';
-                btn.style.opacity = '0.6';
-                responseDiv.style.display = 'block';
-                responseDiv.innerHTML = `
-                    <div style="color: #f59e0b; font-size: 12px;">
-                        <span style="display: inline-block; animation: pulse 1.5s infinite;">●</span> AI is analyzing...
-                    </div>
-                `;
-
-                // Find page context from data
-                const pageData = urls.find(u => u.url === url) || {};
-
-                try {
-                    const resp = await fetch('/api/explain_issue', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            url: url,
-                            issue: issue,
-                            category: category,
-                            details: details,
-                            page_context: {
-                                title: pageData.title || '',
-                                word_count: pageData.word_count || 0,
-                                meta_description: pageData.meta_description || '',
-                                h1: pageData.h1 || ''
-                            }
-                        })
-                    });
-
-                    const result = await resp.json();
-
-                    if (result.success) {
-                        // Cache in localStorage
-                        localStorage.setItem(cacheKey, JSON.stringify(result));
-                        this.displayAIResponse(responseDiv, staticFixDiv, result, btn);
-                    } else {
-                        // API failed — fallback to static ISSUE_KNOWLEDGE
-                        responseDiv.innerHTML = `
-                            <div style="color: #ef4444; font-size: 12px; margin-bottom: 8px;">
-                                ⚠️ AI unavailable. Showing built-in advice:
-                            </div>
-                            <div style="color: #cbd5e1;">
-                                ${this.utils.escapeHtml((ISSUE_KNOWLEDGE[issue] || ISSUE_KNOWLEDGE['_default']).fix)}
-                            </div>
-                        `;
-                        responseDiv.style.display = 'block';
-                        btn.disabled = false;
-                        btn.innerHTML = '✨ Ask AI';
-                        btn.style.opacity = '1';
-                    }
-                } catch (err) {
-                    responseDiv.innerHTML = `
-                        <div style="color: #ef4444; font-size: 12px;">
-                            ❌ Error: ${this.utils.escapeHtml(err.message)}
-                        </div>
-                    `;
-                    responseDiv.style.display = 'block';
-                    btn.disabled = false;
-                    btn.innerHTML = '✨ Ask AI';
-                    btn.style.opacity = '1';
-                }
-            });
-        });
 
         // Attach "Create Ticket" button event listeners
         const ticketButtons = container.querySelectorAll('.ticket-btn');
@@ -459,12 +484,21 @@ LibreCrawlPlugin.register({
                         btn.innerHTML = '✅ Ticket Created';
                         btn.style.opacity = '0.6';
                         btn.style.cursor = 'default';
+
+                        // Update URL cell badge immediately — no need to reload
+                        const row = btn.closest('tr');
+                        const badge = row ? row.querySelector(`.ticket-badge[data-cache-key="${cacheKey}"]`) : null;
+                        if (badge) {
+                            badge.style.display = 'block';
+                            badge.innerHTML = `<a href="${result.ticket_url}" target="_blank"
+                                style="color: #10b981; font-size: 11px; text-decoration: none;">
+                                ✅ PBI #${result.ticket_id} in Azure →
+                            </a>`;
+                        }
+
                         if (ticketResult) {
                             ticketResult.style.display = 'block';
-                            ticketResult.innerHTML = `
-                                <div style="color:#6b7280; margin-bottom:3px;">Azure title: <em>${this.utils.escapeHtml(result.title || '')}</em></div>
-                                <a href="${result.ticket_url}" target="_blank" style="color:#3b82f6; text-decoration:none;">View PBI #${result.ticket_id} in Azure Boards →</a>
-                            `;
+                            ticketResult.innerHTML = `<em style="color:#6b7280; font-size:11px;">${this.utils.escapeHtml(result.title || '')}</em>`;
                         }
                     } else {
                         btn.disabled = false;
@@ -506,81 +540,27 @@ LibreCrawlPlugin.register({
                     const btn = container.querySelector(`.ticket-btn[data-cache-key="${cacheKey}"]`);
                     if (!btn) return;
                     const row = btn.closest('tr');
+
+                    // Badge in the URL cell — visible when scanning the table
+                    const badge = row.querySelector(`.ticket-badge[data-cache-key="${cacheKey}"]`);
+                    if (badge) {
+                        badge.style.display = 'block';
+                        badge.innerHTML = `<a href="${ticket.ticket_url}" target="_blank"
+                            style="color: #10b981; font-size: 11px; text-decoration: none;">
+                            ✅ PBI #${ticket.ticket_id} in Azure →
+                        </a>`;
+                    }
+
+                    // Button state in the How to Fix column — link is already in the URL badge
                     btn.style.display = 'flex';
                     btn.disabled = true;
                     btn.innerHTML = '✅ Ticket Exists';
                     btn.style.opacity = '0.6';
                     btn.style.cursor = 'default';
-                    const ticketResult = row.querySelector(`.ticket-result[data-cache-key="${cacheKey}"]`);
-                    if (ticketResult) {
-                        ticketResult.style.display = 'block';
-                        ticketResult.innerHTML = `<a href="${ticket.ticket_url}" target="_blank" style="color: #3b82f6; text-decoration: none;">View PBI #${ticket.ticket_id} in Azure Boards →</a>`;
-                    }
                 });
             })
             .catch(() => {});
         }
-    },
-
-    displayAIResponse(responseDiv, staticFixDiv, data, btn) {
-        const explanation = data.explanation || '';
-        const howToFix = data.how_to_fix || '';
-        const priority = data.priority || 'medium';
-        const tokensUsed = data.tokens_used || 0;
-
-        const priorityColor = priority === 'high' ? '#ef4444' : priority === 'medium' ? '#f59e0b' : '#10b981';
-
-        responseDiv.innerHTML = `
-            <div style="margin-bottom: 8px;">
-                <div style="color: #e5e7eb; font-weight: 600; margin-bottom: 6px;">🤖 Why it matters</div>
-                <div style="color: #cbd5e1; font-size: 12px; line-height: 1.6;">${this.utils.escapeHtml(explanation)}</div>
-            </div>
-            <div style="margin-bottom: 8px;">
-                <div style="color: #e5e7eb; font-weight: 600; margin-bottom: 6px;">🔧 How to fix</div>
-                <div style="color: #cbd5e1; font-size: 12px; line-height: 1.6;">${howToFix.replace(/•/g, '•')}</div>
-            </div>
-            <div style="display: flex; align-items: center; gap: 8px; margin-top: 8px;">
-                <span style="background: ${priorityColor}20; color: ${priorityColor}; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; text-transform: uppercase;">${priority} priority</span>
-                <span style="color: #6b7280; font-size: 10px;">${tokensUsed} tokens used</span>
-                <button class="regenerate-btn" style="margin-left: auto; background: none; border: 1px solid #374151; color: #9ca3af; padding: 2px 8px; border-radius: 4px; font-size: 10px; cursor: pointer;">🔄 Regenerate</button>
-            </div>
-                   
-        `;
-
-        // Hide static fix text
-        if (staticFixDiv) staticFixDiv.style.display = 'none';
-
-        // Update button
-        btn.disabled = false;
-        btn.innerHTML = '✅ AI Ready';
-        btn.style.opacity = '0.6';
-        btn.style.cursor = 'default';
-
-        // Reveal Create Ticket button now that AI analysis is ready
-        const row = btn.closest('tr');
-        if (row) {
-            const ticketBtn = row.querySelector('.ticket-btn');
-            if (ticketBtn) {
-                ticketBtn.style.display = 'flex';
-            }
-        }
-
-        // Regenerate button handler
-        const regenBtn = responseDiv.querySelector('.regenerate-btn');
-        if (regenBtn) {
-            regenBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                // Clear cache and trigger button click again
-                const cacheKey = btn.dataset.cacheKey;
-                localStorage.removeItem(cacheKey);
-                btn.disabled = false;
-                btn.innerHTML = '✨ Ask AI';
-                btn.style.opacity = '1';
-                btn.style.cursor = 'pointer';
-                btn.click();
-            });
-        }
-
     },
 
     renderHeader() {
@@ -594,6 +574,156 @@ LibreCrawlPlugin.register({
                 </p>
             </div>
         `;
+    },
+
+    renderAgentPanel(data) {
+        return `
+            <div id="pd-agent-panel" style="background: #1f2937; padding: 20px; border-radius: 12px; border: 1px solid #374151; margin-bottom: 32px;">
+            <!--state: idle-->
+            <div id ="agent-idle">
+                <h3> Agent Analysis</h3>
+                <p style="color: #9ca3af; font-size: 14px;">Crawl, tirage and create Azure tickets automatically with human sign-off.</p>
+                <button id="agent-run-btn" style="background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); color: white; border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 12px;">
+                    Start Agent
+                </button>
+            </div>
+
+            <!--state: running-->
+            <div id="agent-running" style="display:none;">
+                <p style="color: #9ca3af; font-size: 14px; margin-bottom: 12px;">Agent is running: crawling, triaging, and creating tickets. Please wait...</p>
+            </div>
+
+            <!--state: triage ready-->
+            <div id="agent-triage" style="display:none;">
+                <h4 style="margin-bottom:12px;">Review Issues for Ticket Creation</h4>
+                <div style="display:flex; gap:16px; min-height:450px;">
+
+                    <!--left: chat-->
+                    <div style="flex:0 0 38%; display:flex; flex-direction:column; border:1px solid #374151; border-radius:8px; overflow:hidden;">
+                        <div id="agent-chat-history" style="flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:8px;"></div>
+                        <div style="border-top:1px solid #374151; padding:8px; display:flex; gap:6px;">
+                            <input id="agent-chat-input" type="text" placeholder="e.g. show only high priority..."
+                                   style="flex:1; background:#111827; border:1px solid #374151; color:#e5e7eb; border-radius:4px; padding:6px 8px; font-size:13px;">
+                            <button id="agent-chat-send" style="background:#2563eb; color:white; border:none; padding:6px 12px; border-radius:4px; font-size:13px; cursor:pointer;">Send</button>
+                        </div>
+                    </div>
+
+                    <!--right: filtered checklist-->
+                    <div style="flex:1; display:flex; flex-direction:column;">
+                        <p id="agent-issue-count" style="color:#9ca3af; font-size:12px; margin-bottom:8px;"></p>
+                        <div id="agent-checklist" style="flex:1; overflow-y:auto; padding-right:8px;"></div>
+                        <button id="agent-approve-btn" style="background:linear-gradient(135deg,#10b981 0%,#047857 100%); color:white; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; margin-top:12px;">
+                            Approve Selected
+                        </button>
+                    </div>
+
+                </div>
+            </div>
+
+            <!--state: done-->
+            <div id="agent-done" style="display:none;">
+                <p id="agent-done-msg" style="color: #10b981; font-size: 14px; margin-bottom: 12px;"></p>
+                <div id="agent-ticket-list" style="max-height: 300px; overflow-y: auto;"></div>
+            </div>
+            </div>`;
+    },
+
+    renderAgentChecklist(container, issues) {
+        const checklist = container.querySelector('#agent-checklist');
+        if (!checklist) return;
+        if (!issues || issues.length === 0) {
+            checklist.innerHTML = `<p style="color: #9ca3af; font-size: 14px;">No issues detected that require ticket creation. Great job!</p>`;
+            return;
+        }
+
+        const grouped = issues.reduce((acc, issue) => {
+            if (!acc[issue.category]) acc[issue.category] = [];
+            acc[issue.category].push(issue);
+            return acc;
+        }, {});
+
+        let idx = 0;
+        checklist.innerHTML = Object.entries(grouped).map(([category, items]) => `
+            <details open style="margin-bottom: 12px;">
+                <summary style="font-weight: 600; cursor: pointer; color: #e5e7eb;">${category} (${items.length})</summary>
+                <div style="margin-top: 8px; padding-left: 16px;">
+                    ${items.map(issue => {
+                        const i = idx++;
+                        const color = issue.priority === 'high' ? '#ef4444' : issue.priority === 'medium' ? '#f59e0b' : '#3b82f6';
+                        return `
+                            <div class="triage-item" data-index="${i}" style="display:flex; align-items:center; margin-bottom:8px; gap:8px;">
+                                <span style="width:10px; height:10px; border-radius:50%; background-color:${color};
+                            flex-shrink:0; display:inline-block;"></span>
+                                <input type="checkbox" class="triage-checkbox"
+                            data-issue='${JSON.stringify(issue).replace(/'/g, "&#39;")}' style="transform:scale(1.2);">
+                                <span style="color:#e5e7eb; font-size:13px; word-break:break-word;">${issue.issue} — <a
+                            href="${issue.url}" target="_blank" style="color:#3b82f6; text-decoration:none;
+                            font-size:12px;">${issue.url}</a></span>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            </details>
+        `).join('');
+
+        const total = issues.length;
+        const countEl = container.querySelector('#agent-issue-count');
+        if (countEl) countEl.textContent = `Showing ${total} of ${total} issues`;
+    },
+
+    renderTicketResults(container, results) {
+        const msg  = container.querySelector('#agent-done-msg');
+        const list = container.querySelector('#agent-ticket-list');
+        const created = results.created || [];
+        const errors  = results.errors  || [];
+
+        msg.textContent = `${created.length} ticket(s) created${errors.length ? `, ${errors.length} failed` : ''}.`;
+
+        list.innerHTML = [
+            ...created.map(t => `
+                <div style="margin-bottom: 8px;">
+                    <a href="${t.ticket_url}" target="_blank"
+                       style="color: #3b82f6; font-size: 13px; text-decoration: none;">${t.title}</a>
+                </div>`),
+            ...errors.map(e => `
+                <div style="margin-bottom: 8px; color: #ef4444; font-size: 12px;">
+                    &#x2717; ${e.url} &mdash; ${e.error}
+                </div>`)
+        ].join('');
+    },
+
+    appendChatMessage(container, text, sender) {
+        const history = container.querySelector('#agent-chat-history');
+        if (!history) return null;
+        const isUser = sender === 'user';
+        const div = document.createElement('div');
+        div.style.cssText = `max-width:85%; padding:8px 10px; border-radius:8px; font-size:13px;
+            align-self:${isUser ? 'flex-end' : 'flex-start'};
+            background:${isUser ? '#2563eb' : '#374151'};
+            color:${isUser ? '#fff' : '#9ca3af'}; word-break:break-word;`;
+        div.textContent = text;
+        history.appendChild(div);
+        history.scrollTop = history.scrollHeight;
+        return div;
+    },
+
+    filterChecklistByContent(container, matches, total) {
+        const showAll = !matches || matches.length === 0;
+        const matchSet = new Set(
+            (matches || []).map(m => `${m.issue}|||${m.url}`)
+        );
+        let visible = 0;
+        container.querySelectorAll('.triage-item').forEach(el => {
+            const cb = el.querySelector('.triage-checkbox');
+            if (!cb) return;
+            const data = JSON.parse(cb.dataset.issue);
+            const key  = `${data.issue}|||${data.url}`;
+            const show = showAll || matchSet.has(key);
+            el.style.display = show ? '' : 'none';
+            if (show) visible++;
+        });
+        const countEl = container.querySelector('#agent-issue-count');
+        if (countEl) countEl.textContent = `Showing ${visible} of ${total} issues`;
     },
 
     renderEmptyState() {
@@ -615,7 +745,8 @@ LibreCrawlPlugin.register({
     // ── Section 1: Summary Cards ────────────────────────────────────────────
 
     renderSummaryCards(issues, internalUrls, links) {
-        const criticalErrors = issues.filter(i => i.type === 'error').length;
+        const CRITICAL_ISSUES = ['[5xx] Server Error', 'DNS Not Found', 'Connection Refused', 'Request Timeout', 'SSL/TLS Error', 'Broken Image', '404 Error'];
+        const criticalErrors = issues.filter(i => CRITICAL_ISSUES.some(crit => (i.issue || '').includes(crit))).length;
 
         const brokenLinksAndImages = internalUrls.filter(u =>
             u.status_code && u.status_code >= 400
@@ -629,8 +760,8 @@ LibreCrawlPlugin.register({
         ).size;
 
         const perfProblems = internalUrls.filter(u =>
-            (u.response_time && u.response_time > 1000) ||
-            (u.size && u.size > 102400)
+            (u.response_time && u.response_time > 3000) ||
+            (u.size && u.size > 512000) // 50KB
         ).length;
 
         return `
@@ -748,8 +879,9 @@ LibreCrawlPlugin.register({
 
         return `
             <tr style="border-bottom: 1px solid #374151;" data-category="${category}" data-type = "${issue.type || 'info'}" data-issue-name="${this.utils.escapeHtml(issue.issue || '')}" data-cache-key="${cacheKey}">
-                <td style="padding: 12px; color: #cbd5e1; font-size: 13px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    <a href="${url}" target="_blank" style="color: #3b82f6; text-decoration: none;">${shortUrl}</a>
+                <td style="padding: 12px; color: #cbd5e1; font-size: 13px; max-width: 300px;">
+                    <a href="${url}" target="_blank" style="color: #3b82f6; text-decoration: none; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${shortUrl}</a>
+                    <div class="ticket-badge" data-cache-key="${cacheKey}" style="display: none; margin-top: 4px;"></div>
                 </td>
                 <td style="padding: 12px;">
                     <span style="background: ${categoryColor}20; color: ${categoryColor}; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;">
@@ -762,9 +894,6 @@ LibreCrawlPlugin.register({
                 <td style="padding: 12px; color: #cbd5e1; font-size: 13px; line-height: 1.5; white-space: normal; word-break: break-word; min-width: 250px;">
                     <div class="static-fix">${fix}</div>
                     <div style="display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;">
-                        <button class="ai-btn" data-url="${url}" data-issue="${this.utils.escapeHtml(issue.issue || '')}" data-category="${this.utils.escapeHtml(category)}" data-details="${this.utils.escapeHtml(issue.details || '')}" data-cache-key="${cacheKey}" data-issue-type="${this.utils.escapeHtml(issue.type || 'info')}" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 11px; cursor: pointer; display: flex; align-items: center; gap: 4px; transition: opacity 0.2s;" onmouseover="this.style.opacity=0.8" onmouseout="this.style.opacity=1">
-                            ✨ Ask AI
-                        </button>
                         ${(issue.type || 'info') !== 'info' ? `
                         <button class="ticket-btn" data-url="${url}" data-issue="${this.utils.escapeHtml(issue.issue || '')}" data-category="${this.utils.escapeHtml(category)}" data-issue-type="${this.utils.escapeHtml(issue.type || 'info')}" data-cache-key="${cacheKey}" style="display: none; background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 11px; cursor: pointer; align-items: center; gap: 4px; transition: opacity 0.2s;" onmouseover="this.style.opacity=0.8" onmouseout="this.style.opacity=1">
                             🎫 Create Ticket
