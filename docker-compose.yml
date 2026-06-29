@@ -41,6 +41,11 @@ services:
       - AZURE_DEVOPS_SM_EMAIL=${AZURE_DEVOPS_SM_EMAIL}
       - AZURE_DEVOPS_PROCESS=${AZURE_DEVOPS_PROCESS}
       - AZURE_QA_STATE=${AZURE_QA_STATE:-QA}
+      - AZURE_QA_DONE_STATE=${AZURE_QA_DONE_STATE:-Done}
+      - AZURE_QA_TAG=${AZURE_QA_TAG:-qa-agent}
+      - AGENT2_ENABLED=${AGENT2_ENABLED:-true}
+      - AGENT3_ENABLED=${AGENT3_ENABLED:-true}
+      - AGENT4_ENABLED=${AGENT4_ENABLED:-true}
       # Agent 3 WordPress integration. Leave blank unless a real staging/sandbox
       # site is configured for this container to reach.
       - WP_USERNAME=${WP_USERNAME}
