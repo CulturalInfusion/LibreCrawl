@@ -1954,9 +1954,30 @@ def create_bulk_tickets():
             issue.get("role", ""),
             project,
             parent_id,
+            assignee=issue.get("assignee") or None,
             user_id=session.get('user_id')
         )
         if success:
+            try:
+                from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
+                fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
+                result['agent3_status'] = fix_result.get('status')
+                result['agent3_reason'] = fix_result.get('reason', '')
+                result['agent3_object_id'] = fix_result.get('object_id')
+                result['agent3_object_type'] = fix_result.get('object_type')
+
+                if fix_result['status'] == 'fixed':
+                    qa_state = os.getenv('AZURE_QA_STATE', 'QA')
+                    result['agent3_qa_state'] = qa_state
+                    result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
+                    if fix_result.get('caveat'):
+                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
+                elif fix_result['status'] == 'deferred':
+                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
+            except Exception as e:
+                result['agent3_status'] = 'error'
+                result['agent3_reason'] = f'Agent 3 failed: {e}'
+
             created.append(result)
         else:
             errors.append({**result, 'url': url})
@@ -2089,158 +2110,6 @@ def devops_identities():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-_agent_state = {}
-
-@app.route("/api/agent/start_workflow", methods=['POST'])
-def start_workflow():
-    global _agent_state
-    data = request.get_json()
-    _agent_state["url"]     = data.get("url")
-    _agent_state["project"] = data.get("project")
-    _agent_state["feature"] = data.get("feature")
-    _agent_state["status"]  = "Workflow started"
-    _agent_state["issues"]  = data.get("issues", [])
-    _agent_state["results"] = None
-
-    issues = _agent_state["issues"]
-    thread = threading.Thread(target=run_triage_agent, args=(issues,), daemon=True)
-    thread.start()
-
-    return jsonify({'success': True})
-
-@app.route("/api/agent/workflow_trigger", methods=['GET'])
-def workflow_trigger():
-    global _agent_state
-    if _agent_state.get("status") != "Workflow started":
-        return jsonify({'success': False, 'error': 'No active workflow'}), 400
-    
-    _agent_state["status"] = "Crawling"
-
-    return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature"), 'issues': _agent_state.get("issues", [])})
-
-@app.route("/api/agent/triage", methods=['POST'])
-def agent_triage():
-    global _agent_state
-    data = request.get_json()
-    _agent_state["triage"] = data.get("issues", [])
-    _agent_state["status"] = "Triage ready"
-    return jsonify({'success': True})
-
-@app.route("/api/agent/triage", methods=['GET'])
-def get_triage():
-    global _agent_state
-    if _agent_state.get("status") != "Triage ready":
-        return jsonify({'success': False, 'error': 'Triage not ready'}), 400
-    return jsonify({'success': True, 'issues': _agent_state.get("triage", [])})
-
-@app.route("/api/agent/approval", methods=['POST'])
-def agent_approval():
-    global _agent_state
-    data = request.get_json()
-    _agent_state["approval"] = data.get("approval", [])
-    _agent_state["status"] = "Approval received"
-    return jsonify({'success': True})
-
-@app.route("/api/agent/approval", methods=['GET'])
-def get_approval():
-    global _agent_state
-    if _agent_state.get("status") != "Approval received":
-        return jsonify({'success': False, 'error': 'Approval not received'}), 400
-    return jsonify({'success': True, 'approval': _agent_state.get("approval", [])})
-
-@app.route("/api/agent/create_bulk_tickets", methods=['POST'])
-def create_bulk_tickets():
-    global _agent_state
-    data      = request.get_json()
-    approved  = data.get("approved", [])
-    project   = _agent_state.get("project", "")
-    parent_id = _agent_state.get("feature", "")
-
-    import base64 as _b64
-    from src.crawl_db import get_tickets_for_issues
-
-    created = []
-    errors  = []
-
-    # Generate cache_keys matching the JS formula used by the plugin:
-    # 'ai_' + btoa(unescape(encodeURIComponent(url+'|'+issue))).replace(/[=+/]/g, '')
-    # Python equivalent: base64(utf-8 bytes), strip =, +, /
-    def _cache_key(u, iss):
-        raw = (u + '|' + iss).encode('utf-8')
-        return 'ai_' + _b64.b64encode(raw).decode('ascii').replace('=', '').replace('+', '').replace('/', '')
-
-    pairs    = [{'url': i.get('url',''), 'issue': i.get('issue',''), 'cache_key': _cache_key(i.get('url',''), i.get('issue',''))} for i in approved]
-    existing = get_tickets_for_issues(pairs)
-
-    for i, issue in enumerate(approved):
-        url        = issue.get("url", "")
-        issue_name = issue.get("issue", "")
-        ck         = pairs[i]['cache_key']
-
-        if ck in existing:
-            t = existing[ck]
-            created.append({
-                'ticket_id': t.get('ticket_id'),
-                'ticket_url': t.get('ticket_url'),
-                'title': issue_name,
-                'skipped': True,
-                'agent3_status': 'skipped',
-                'agent3_reason': 'ticket already exists'
-            })
-            continue
-
-        success, result = _create_single_ticket(
-            url,
-            issue_name,
-            issue.get("category", ""),
-            issue.get("type", "warning"),
-            issue.get("explanation", ""),
-            issue.get("how_to_fix", ""),
-            issue.get("priority", "medium"),
-            issue.get("role", ""),
-            project,
-            parent_id,
-            assignee=issue.get("assignee") or None,
-            user_id=session.get('user_id')
-        )
-        if success:
-            try:
-                from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
-                fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
-                result['agent3_status'] = fix_result.get('status')
-                result['agent3_reason'] = fix_result.get('reason', '')
-                result['agent3_object_id'] = fix_result.get('object_id')
-                result['agent3_object_type'] = fix_result.get('object_type')
-
-                if fix_result['status'] == 'fixed':
-                    qa_state = os.getenv('AZURE_QA_STATE', 'QA')
-                    result['agent3_qa_state'] = qa_state
-                    result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
-                    if fix_result.get('caveat'):
-                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
-                elif fix_result['status'] == 'deferred':
-                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
-            except Exception as e:
-                # Ticket was already created in Azure above — don't let a downstream
-                # Agent 3 failure (e.g. WordPress unreachable) drop the whole batch.
-                result['agent3_status'] = 'error'
-                result['agent3_reason'] = f'Agent 3 failed: {e}'
-
-            created.append(result)
-        else:
-            errors.append({**result, 'url': url})
-
-    _agent_state["results"] = {"created": created, "errors": errors}
-    _agent_state["status"]  = "Completed"
-    return jsonify({'success': True, 'created': created, 'errors': errors})
-
-@app.route("/api/agent/results", methods=['GET'])
-def get_results():
-    global _agent_state
-    if _agent_state.get("status") != "Completed":
-        return jsonify({'ready': False})
-    return jsonify({'ready': True, 'results': _agent_state.get("results", {})})
-
 @app.route("/api/agent/provider_options", methods=['GET'])
 def provider_options():
     return jsonify({
@@ -2261,74 +2130,6 @@ def set_provider():
         return jsonify({'success': False, 'error': 'OpenAI API key not configured'}), 400
     set_provider_override(provider)
     return jsonify({'success': True, 'provider': provider})
-
-@app.route("/api/agent/chat", methods=['POST'])
-def agent_chat():
-    provider = get_provider()
-    if provider is None:
-        return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
-
-    data    = request.get_json()
-    message = data.get('message', '')
-    issues  = data.get('issues', [])
-
-    issue_lines = '\n'.join(
-        f"{iss.get('issue','')} | {iss.get('url','')} | priority:{iss.get('priority','?')} | type:{iss.get('type','')}"
-        for iss in issues
-    )
-
-    prompt = f"""You are helping a developer triage SEO audit issues before creating tickets.
-
-Issue list (issue | url | priority | type):
-{issue_lines}
-
-User request: {message}
-
-First, write 1-2 sentences summarising what you found and listing the matched issue names.
-Then output a JSON block with the exact issue name and url for each match:
-{{"matches": [{{"issue": "exact issue name", "url": "exact url"}}]}}
-
-If all issues should be shown, include them all. Copy issue names and URLs exactly as written above. Always include the JSON block."""
-
-    try:
-        if provider == 'anthropic':
-            resp = anthropic_client.messages.create(
-                model=ANTHROPIC_MODEL,
-                system='You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.',
-                messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=4096,
-            )
-            text = resp.content[0].text
-        else:
-            resp = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {'role': 'system', 'content': 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                max_tokens=4096,
-            )
-            text = resp.choices[0].message.content
-
-        json_match = re.search(r'\{\s*"matches"\s*:', text)
-        if json_match:
-            json_start = json_match.start()
-            json_end   = text.rfind('}') + 1
-            match_data = json.loads(text[json_start:json_end])
-            reply      = text[:json_start].strip()
-        else:
-            match_data = {'matches': []}
-            reply      = text.strip()
-
-        return jsonify({
-            'success': True,
-            'reply': reply,
-            'matches': match_data.get('matches', [])
-        })
-
-    except Exception as e:
-        print(f"[Chat] Error: {e}")
-        return jsonify({'success': False, 'error': 'Chat request failed'}), 500
 
 def main():
     import signal
