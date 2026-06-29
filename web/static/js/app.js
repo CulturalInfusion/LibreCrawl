@@ -62,6 +62,9 @@ async function initializeApp() {
     // Load Azure DevOps project/board selectors if configured
     loadDevopsProjects();
 
+    // Load AI provider selector if both providers are configured
+    loadProviderOptions();
+
     // DEBUG: Check sessionStorage
     console.log('DEBUG: Checking sessionStorage force_ui_refresh:', sessionStorage.getItem('force_ui_refresh'));
 
@@ -2299,6 +2302,34 @@ function renderIssueRow(row, issue, index) {
     `;
 }
 
+// ── AI provider selector ─────────────────────────────────────────────────────
+
+async function loadProviderOptions() {
+    const selector = document.getElementById('provider-selector');
+    const select   = document.getElementById('provider-select');
+    try {
+        const resp = await fetch('/api/agent/provider_options');
+        const data = await resp.json();
+        if (data.anthropic_available && data.openai_available) {
+            select.value = data.current || 'anthropic';
+            selector.style.display = 'flex';
+        }
+    } catch (_) {}
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const select = document.getElementById('provider-select');
+    if (select) {
+        select.addEventListener('change', async () => {
+            await fetch('/api/agent/set_provider', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ provider: select.value })
+            });
+        });
+    }
+});
+
 // ── Azure DevOps project / feature selectors ────────────────────────────────
 
 window.devopsContext  = { project: '', parentId: '', parentName: '' };
@@ -2323,6 +2354,54 @@ async function loadDevopsProjects() {
         }
     } catch (_) {}
 }
+
+// Live search-as-you-type against Azure's own identity picker (matches what the
+// AssignedTo field uses natively — verified via DevTools, not a preloaded list,
+// since Azure's org directory can be far larger than any one project's team).
+// Attach to any plain <input>; selecting a suggestion stores the resolved email
+// on input.dataset.email for the caller to read at submit time.
+window.attachIdentitySearch = function(input) {
+    if (!input || input.dataset.identitySearchAttached) return;
+    input.dataset.identitySearchAttached = '1';
+
+    const list = document.createElement('div');
+    list.className = 'identity-suggestions';
+    list.style.cssText = 'position:absolute; top:100%; left:0; min-width:160px; width:max-content; z-index:9999; background:#0f172a; border:1px solid #374151; border-radius:6px; max-height:160px; overflow-y:auto; display:none; font-size:12px; box-shadow:0 4px 12px rgba(0,0,0,0.4);';
+    input.insertAdjacentElement('afterend', list);
+    if (getComputedStyle(input.parentElement).position === 'static') {
+        input.parentElement.style.position = 'relative';
+    }
+
+    let debounceTimer;
+    input.addEventListener('input', () => {
+        input.dataset.email = '';
+        clearTimeout(debounceTimer);
+        const q = input.value.trim();
+        if (q.length < 2) { list.style.display = 'none'; return; }
+        debounceTimer = setTimeout(async () => {
+            try {
+                const resp = await fetch(`/api/devops/identities?q=${encodeURIComponent(q)}`);
+                const data = await resp.json();
+                const members = data.success ? data.members : [];
+                if (!members.length) { list.style.display = 'none'; return; }
+                list.innerHTML = members.map(m =>
+                    `<div class="identity-option" data-email="${m.email}" data-name="${m.name}" style="padding:6px 8px; cursor:pointer; color:#e5e7eb;">${m.name} <span style="color:#6b7280;">${m.email}</span></div>`
+                ).join('');
+                list.style.display = 'block';
+            } catch (_) {}
+        }, 300);
+    });
+
+    list.addEventListener('mousedown', (e) => {
+        const opt = e.target.closest('.identity-option');
+        if (!opt) return;
+        input.value = opt.dataset.name;
+        input.dataset.email = opt.dataset.email;
+        list.style.display = 'none';
+    });
+
+    input.addEventListener('blur', () => setTimeout(() => { list.style.display = 'none'; }, 150));
+};
 
 async function loadDevopsFeatures(project) {
     const boardInput = document.getElementById('devops-board-input');

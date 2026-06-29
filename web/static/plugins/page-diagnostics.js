@@ -217,6 +217,8 @@ LibreCrawlPlugin.register({
             </div>
         `;
 
+        container.querySelectorAll('.assignee-select').forEach(input => window.attachIdentitySearch(input));
+
         // Handler 1: Run Agent button
         let _triageIssues = [];
         const runBtn = container.querySelector('#agent-run-btn');
@@ -259,7 +261,12 @@ LibreCrawlPlugin.register({
         if (approveBtn) {
             approveBtn.addEventListener('click', async () => {
                 const checked = Array.from(container.querySelectorAll('.triage-checkbox:checked'));
-                const approved = checked.map(cb => JSON.parse(cb.dataset.issue));
+                const approved = checked.map(cb => {
+                    const issue = JSON.parse(cb.dataset.issue);
+                    const assigneeSelect = cb.closest('.triage-item')?.querySelector('.qa-assignee-select');
+                    issue.assignee = assigneeSelect?.dataset.email || '';
+                    return issue;
+                });
 
                 approveBtn.disabled = true;
                 approveBtn.textContent = '⏳ Submitting...';
@@ -462,6 +469,7 @@ LibreCrawlPlugin.register({
 
                 try {
                     const ctx = window.devopsContext || {};
+                    const assigneeSelect = row.querySelector(`.assignee-select[data-cache-key="${cacheKey}"]`);
                     const resp = await fetch('/api/create_devops_ticket', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -475,7 +483,8 @@ LibreCrawlPlugin.register({
                             ai_priority:      aiPriority,
                             ai_role:          aiRole,
                             project_override:   ctx.project  || '',
-                            parent_id_override: ctx.parentId || ''
+                            parent_id_override: ctx.parentId || '',
+                            assignee_override:  assigneeSelect?.dataset.email || ''
                         })
                     });
                     const result = await resp.json();
@@ -656,6 +665,8 @@ LibreCrawlPlugin.register({
                             flex-shrink:0; display:inline-block;"></span>
                                 <input type="checkbox" class="triage-checkbox"
                             data-issue='${JSON.stringify(issue).replace(/'/g, "&#39;")}' style="transform:scale(1.2);">
+                                <span class="ticket-exists-tick" style="display:none; flex-shrink:0;"></span>
+                                <input type="text" class="qa-assignee-select" autocomplete="off" data-index="${i}" placeholder="Assignee…" style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 4px 6px; border-radius: 4px; font-size: 11px; flex-shrink:0; width: 110px;">
                                 <span style="color:#e5e7eb; font-size:13px; word-break:break-word;">${issue.issue} — <a
                             href="${issue.url}" target="_blank" style="color:#3b82f6; text-decoration:none;
                             font-size:12px;">${issue.url}</a></span>
@@ -665,6 +676,45 @@ LibreCrawlPlugin.register({
                 </div>
             </details>
         `).join('');
+
+        checklist.querySelectorAll('.qa-assignee-select').forEach(input => window.attachIdentitySearch(input));
+
+        // Mark issues that already have a ticket so they aren't re-approved blindly —
+        // bulk creation silently skips them server-side, which is confusing without
+        // this. Same cache-key formula and endpoint the issues table already uses.
+        const cacheKeyFor = (url, issueName) =>
+            'ai_' + btoa(unescape(encodeURIComponent(url + '|' + issueName))).replace(/[=+/]/g, '');
+        const pairs = issues.map(issue => ({
+            url: issue.url,
+            issue: issue.issue,
+            cache_key: cacheKeyFor(issue.url, issue.issue)
+        }));
+        if (pairs.length > 0) {
+            fetch('/api/devops_tickets/check', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pairs })
+            })
+            .then(r => r.json())
+            .then(result => {
+                if (!result.success) return;
+                checklist.querySelectorAll('.triage-checkbox').forEach(cb => {
+                    const issueData = JSON.parse(cb.dataset.issue);
+                    const key = cacheKeyFor(issueData.url, issueData.issue);
+                    const ticket = result.tickets[key];
+                    if (!ticket) return;
+
+                    cb.checked  = false;
+                    cb.disabled = true;
+                    const tick = cb.closest('.triage-item')?.querySelector('.ticket-exists-tick');
+                    if (tick) {
+                        tick.style.display = 'inline';
+                        tick.innerHTML = `<a href="${ticket.ticket_url}" target="_blank" title="Ticket already exists — #${ticket.ticket_id}" style="text-decoration:none; font-size:13px;">✅</a>`;
+                    }
+                });
+            })
+            .catch(() => {});
+        }
 
         const total = issues.length;
         const countEl = container.querySelector('#agent-issue-count');
@@ -893,8 +943,9 @@ LibreCrawlPlugin.register({
                 </td>
                 <td style="padding: 12px; color: #cbd5e1; font-size: 13px; line-height: 1.5; white-space: normal; word-break: break-word; min-width: 250px;">
                     <div class="static-fix">${fix}</div>
-                    <div style="display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;">
+                    <div style="display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center;">
                         ${(issue.type || 'info') !== 'info' ? `
+                        <input type="text" class="assignee-select" autocomplete="off" data-cache-key="${cacheKey}" placeholder="Assignee…" style="display: none; background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 6px 8px; border-radius: 6px; font-size: 11px; width: 140px;">
                         <button class="ticket-btn" data-url="${url}" data-issue="${this.utils.escapeHtml(issue.issue || '')}" data-category="${this.utils.escapeHtml(category)}" data-issue-type="${this.utils.escapeHtml(issue.type || 'info')}" data-cache-key="${cacheKey}" style="display: none; background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 11px; cursor: pointer; align-items: center; gap: 4px; transition: opacity 0.2s;" onmouseover="this.style.opacity=0.8" onmouseout="this.style.opacity=1">
                             🎫 Create Ticket
                         </button>` : ''}

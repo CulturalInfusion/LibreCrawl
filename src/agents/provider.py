@@ -3,16 +3,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Reasoning-quality models for the agentic loop.
-# These are deliberately higher-tier than explain_issue (Haiku/GPT-3.5)
-# because the loop needs to make multi-step decisions, not just generate text.
 ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-6')
 OPENAI_MODEL    = os.getenv('OPENAI_MODEL', 'gpt-4o')
 
+_provider_override = None
+
+def _env(name):
+    return (os.getenv(name) or '').strip()
+
+def set_provider_override(provider):
+    global _provider_override
+    _provider_override = provider
+
 def get_provider():
-    """Returns which AI provider is configured based on available API keys."""
-    if os.getenv('ANTHROPIC_API_KEY'):
+    if _provider_override:
+        return _provider_override
+    if _env('ANTHROPIC_API_KEY'):
         return 'anthropic'
-    if os.getenv('OPENAI_API_KEY'):
+    if _env('OPENAI_API_KEY'):
         return 'openai'
     return None
 
@@ -32,13 +40,13 @@ def call_with_tools(messages, tools, system=""):
 
     if provider == 'anthropic':
         from anthropic import Anthropic
-        client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+        client = Anthropic(api_key=_env('ANTHROPIC_API_KEY'))
         resp = client.messages.create(
             model=ANTHROPIC_MODEL,
             system=system,
-            tools=tools,
             messages=messages,
             max_tokens=4096,
+            **({'tools': tools} if tools else {}),
         )
         tool_calls = [b for b in resp.content if b.type == 'tool_use']
         text       = next((b.text for b in resp.content if b.type == 'text'), '')
@@ -46,7 +54,7 @@ def call_with_tools(messages, tools, system=""):
 
     elif provider == 'openai':
         from openai import OpenAI
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        client = OpenAI(api_key=_env('OPENAI_API_KEY'))
 
         # Anthropic and OpenAI use the same JSON Schema for parameters,
         # but wrap them differently at the outer level.
@@ -62,9 +70,9 @@ def call_with_tools(messages, tools, system=""):
         msgs = ([{'role': 'system', 'content': system}] + messages) if system else messages
         resp  = client.chat.completions.create(
             model=OPENAI_MODEL,
-            tools=oai_tools,
             messages=msgs,
             max_tokens=4096,
+            **({'tools': oai_tools} if oai_tools else {}),
         )
         choice     = resp.choices[0]
         tool_calls = choice.message.tool_calls or []

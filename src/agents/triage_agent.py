@@ -112,7 +112,11 @@ def run_agentic(issues):
         "Call these four tools in order — none require parameters:\n"
         "1. select_issues — explains the crawl issues and prepares them for review\n"
         "2. post_triage_results — sends the list to the browser for human approval\n"
-        "3. poll_approval — call repeatedly until success=true (human clicked Approve)\n"
+        "3. poll_approval — a human is reviewing the issues in their browser and may take "
+        "several minutes. Call this tool again every time it returns success=false, with "
+        "no limit on how many attempts that takes. Never decide on your own that the human "
+        "isn't responding, never give up, and never stop to report a problem at this step — "
+        "the only valid way to leave step 3 is a poll_approval result with success=true.\n"
         "4. create_bulk_tickets — creates the approved tickets in Azure DevOps\n"
         "Do not pass any parameters to any tool. Just call them in sequence."
     )

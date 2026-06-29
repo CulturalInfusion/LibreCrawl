@@ -19,6 +19,7 @@ from functools import wraps
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
 from src.agents.triage_agent import run_agentic as run_triage_agent
+from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL
 from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, create_magic_link, verify_magic_link
 from src.email_service import send_verification_email, send_welcome_email, send_magic_link_email
 
@@ -26,21 +27,29 @@ from src.email_service import send_verification_email, send_welcome_email, send_
 from dotenv import load_dotenv
 load_dotenv()
 
-# OpenAI client 
-try:
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-except ImportError:
-    openai_client = None
-    print("Warning: openai package not installed.")
+# OpenAI client
+openai_client = None
+openai_api_key = (os.getenv('OPENAI_API_KEY') or '').strip()
+if openai_api_key:
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=openai_api_key)
+    except ImportError:
+        print("Warning: openai package not installed.")
+    except Exception:
+        print("Warning: OpenAI client could not be initialized.")
 
-# Anthropic client 
-try:
-    from anthropic import Anthropic
-    anthropic_client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
-except ImportError:
-    anthropic_client = None
-    print("Warning: anthropic package not installed.")
+# Anthropic client
+anthropic_client = None
+anthropic_api_key = (os.getenv('ANTHROPIC_API_KEY') or '').strip()
+if anthropic_api_key:
+    try:
+        from anthropic import Anthropic
+        anthropic_client = Anthropic(api_key=anthropic_api_key)
+    except ImportError:
+        print("Warning: anthropic package not installed.")
+    except Exception:
+        print("Warning: Anthropic client could not be initialized.")
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LibreCrawl - SEO Spider Tool')
@@ -1542,7 +1551,7 @@ def explain_issue():
     """Generate AI-powered explanation and fix for a crawl issue using OpenAI"""
     try:
         # Check if OpenAI and Anthropic client is available
-        provider = 'anthropic' if anthropic_client else 'openai' if openai_client else None
+        provider = get_provider()
         if provider is None:
             return jsonify({
                 'success': False,
@@ -1646,7 +1655,7 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             'error': str(e)
         }), 500
 
-def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_how_to_fix, ai_priority, ai_role, project, parent_id, user_id=None):
+def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_how_to_fix, ai_priority, ai_role, project, parent_id, assignee=None, user_id=None):
     """Shared ticket creation logic used by both the single-issue route and bulk agent route."""
     import base64
     from urllib.parse import urlparse, quote
@@ -1708,7 +1717,7 @@ def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_h
         {'op': 'add', 'path': '/fields/System.Title',                             'value': title},
         {'op': 'add', 'path': '/fields/System.Description',                       'value': description_html},
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.Priority',           'value': az_priority},
-        {'op': 'add', 'path': '/fields/System.AssignedTo',                        'value': sm_email},
+        {'op': 'add', 'path': '/fields/System.AssignedTo',                        'value': assignee or sm_email},
         {'op': 'add', 'path': '/fields/Microsoft.VSTS.Common.AcceptanceCriteria', 'value': ac_html},
         {'op': 'add', 'path': '/fields/System.AreaPath',                          'value': f'{project}\\{os.environ.get("AZURE_AREA_SUFFIX")}'},
         {'op': 'add', 'path': '/relations/-', 'value': {
@@ -1745,6 +1754,7 @@ def create_devops_ticket():
     ai_fix      = data.get('ai_how_to_fix', '')
     ai_priority = data.get('ai_priority', 'medium')
     ai_role     = data.get('ai_role', '')
+    assignee    = data.get('assignee_override') or None
 
     project   = data.get('project_override') or os.getenv('AZURE_DEVOPS_PROJECT', '')
     parent_id = data.get('parent_id_override') or os.getenv('AZURE_DEVOPS_PARENT_ID', '')
@@ -1756,7 +1766,7 @@ def create_devops_ticket():
 
     success, result = _create_single_ticket(
         url, issue, category, issue_type, ai_exp, ai_fix, ai_priority, ai_role,
-        project, parent_id, user_id=session.get('user_id')
+        project, parent_id, assignee=assignee, user_id=session.get('user_id')
     )
     if success:
         return jsonify({'success': True, **result})
@@ -1944,9 +1954,30 @@ def create_bulk_tickets():
             issue.get("role", ""),
             project,
             parent_id,
+            assignee=issue.get("assignee") or None,
             user_id=session.get('user_id')
         )
         if success:
+            try:
+                from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
+                fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
+                result['agent3_status'] = fix_result.get('status')
+                result['agent3_reason'] = fix_result.get('reason', '')
+                result['agent3_object_id'] = fix_result.get('object_id')
+                result['agent3_object_type'] = fix_result.get('object_type')
+
+                if fix_result['status'] == 'fixed':
+                    qa_state = os.getenv('AZURE_QA_STATE', 'QA')
+                    result['agent3_qa_state'] = qa_state
+                    result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
+                    if fix_result.get('caveat'):
+                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
+                elif fix_result['status'] == 'deferred':
+                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
+            except Exception as e:
+                result['agent3_status'] = 'error'
+                result['agent3_reason'] = f'Agent 3 failed: {e}'
+
             created.append(result)
         else:
             errors.append({**result, 'url': url})
@@ -2029,6 +2060,76 @@ If all issues should be shown, include them all. Copy issue names and URLs exact
     except Exception as e:
         print(f"[Chat] Error: {e}")
         return jsonify({'success': False, 'error': 'Chat request failed'}), 500
+
+@app.route('/api/devops/identities', methods=['GET'])
+@login_required
+def devops_identities():
+    org   = os.getenv('AZURE_DEVOPS_ORG')
+    pat   = os.getenv('AZURE_DEVOPS_PAT')
+    query = request.args.get('q', '').strip()
+    if not org or not pat:
+        return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG or AZURE_DEVOPS_PAT not configured'}), 400
+    if not query:
+        return jsonify({'success': True, 'members': []})
+
+    import base64
+    token   = base64.b64encode(f':{pat}'.encode()).decode()
+    headers = {
+        'Authorization': f'Basic {token}',
+        'Content-Type': 'application/json',
+        # IdentityPicker is an older internal API surface — api-version goes in the
+        # Accept header, not as a query param like every other Azure call in this
+        # file. Exact value verified via DevTools against a real org.
+        'Accept': 'application/json;api-version=5.0-preview.1;excludeUrls=true;enumsAsNumbers=true;msDateFormat=true;noArrayWrap=true',
+    }
+    url  = f'https://dev.azure.com/{org}/_apis/IdentityPicker/Identities'
+    body = {
+        'query': query,
+        'identityTypes': ['user', 'servicePrincipal'],
+        'operationScopes': ['ims', 'source'],
+        'options': {'MinResults': 5, 'MaxResults': 20},
+        'properties': ['DisplayName', 'SamAccountName', 'Active', 'SubjectDescriptor', 'Mail'],
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        members = []
+        for result in data.get('results', []):
+            for identity in result.get('identities', []):
+                if identity.get('active') is False:
+                    continue
+                email = identity.get('mail') or identity.get('signInAddress') or identity.get('samAccountName', '')
+                if email:
+                    members.append({'email': email, 'name': identity.get('displayName', email)})
+        return jsonify({'success': True, 'members': members})
+    except requests.exceptions.HTTPError:
+        return jsonify({'success': False, 'error': f'Azure DevOps {resp.status_code}: {resp.text}'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route("/api/agent/provider_options", methods=['GET'])
+def provider_options():
+    return jsonify({
+        'anthropic_available': bool(os.getenv('ANTHROPIC_API_KEY')),
+        'openai_available': bool(os.getenv('OPENAI_API_KEY')),
+        'current': get_provider()
+    })
+
+@app.route("/api/agent/set_provider", methods=['POST'])
+def set_provider():
+    data = request.get_json()
+    provider = data.get('provider')
+    if provider not in ('anthropic', 'openai'):
+        return jsonify({'success': False, 'error': 'Invalid provider'}), 400
+    if provider == 'anthropic' and not os.getenv('ANTHROPIC_API_KEY'):
+        return jsonify({'success': False, 'error': 'Anthropic API key not configured'}), 400
+    if provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
+        return jsonify({'success': False, 'error': 'OpenAI API key not configured'}), 400
+    set_provider_override(provider)
+    return jsonify({'success': True, 'provider': provider})
 
 def main():
     import signal
