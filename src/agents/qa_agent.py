@@ -1,3 +1,12 @@
+"""
+Agent 4 — QA / Validation.
+Triggered by: supervisor selecting tickets in the QA bulk panel (tag: AZURE_QA_TAG),
+or clicking "Run QA" on a single ticket.
+Input: Azure ticket ID. Output: pass (ticket marked Done) or fail (AI-drafted comment
+posted explaining what still needs fixing).
+Read-only — re-crawls the URL but writes nothing to the site. Azure writes
+(mark Done, post comment) are handled by the calling route in main.py, not here.
+"""
 import os
 import re
 import base64

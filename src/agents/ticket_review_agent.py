@@ -1,3 +1,11 @@
+"""
+Agent 2 — Ticket Review (Triage).
+Triggered by: Agent 1 completing a crawl and posting issues to the workflow queue.
+Input: list of crawl issues. Output: Azure DevOps tickets for human-approved issues.
+Flow: explain issues (parallel AI calls) → post to browser for review → poll for
+human approval → create tickets for approved items.
+Does NOT apply any fixes — that is Agent 3's job.
+"""
 import time
 import json
 from src.mcp_server import (
