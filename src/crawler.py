@@ -74,6 +74,22 @@ from src.core.memory_monitor import MemoryMonitor
 from src.core.memory_profiler import UserMemoryTracker
 
 
+def check_single_url(url):
+    """Re-fetch and re-analyze exactly one URL, outside the full crawl lifecycle.
+    Used by Agent 4 (QA agent) to verify whether a previously-flagged issue still
+    exists. Synchronous, no threads, no DB writes — a bare WebCrawler with just
+    enough components wired up for a single-page fetch + issue detection pass.
+    Returns (result_dict, issues_list).
+    """
+    crawler = WebCrawler()
+    crawler.base_domain = urlparse(url).netloc
+    crawler.link_manager = LinkManager(crawler.base_domain)
+    crawler.issue_detector = IssueDetector(crawler.config.get('issue_exclusion_patterns', []))
+    result = crawler._crawl_url_with_requests(url, depth=0)
+    crawler.issue_detector.detect_issues(result)
+    return result, crawler.issue_detector.get_issues()
+
+
 class WebCrawler:
     """
     Main web crawler with smooth rate limiting and comprehensive SEO analysis.

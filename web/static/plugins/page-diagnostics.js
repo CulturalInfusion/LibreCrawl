@@ -210,6 +210,8 @@ LibreCrawlPlugin.register({
             <div class="plugin-content" style="padding: 20px; overflow-y: auto; overflow-x: hidden; max-height: calc(100vh - 280px);">
                 ${this.renderHeader()}
                 ${this.renderAgentPanel(data)}
+                ${this.renderQaBulkPanel()}
+                ${this.renderQaPanel()}
                 ${this.renderSummaryCards(issues, internalUrls, links)}
                 ${this.renderIssuesTable(issues)}
                 ${this.renderMetaTagMatrix(internalUrls)}
@@ -218,6 +220,141 @@ LibreCrawlPlugin.register({
         `;
 
         container.querySelectorAll('.assignee-select').forEach(input => window.attachIdentitySearch(input));
+
+        // Handler: Check Ticket button (Agent 4) — single-ticket lookup by Azure ID,
+        // separate from the Agent 2/3 panel/state-machine above so the two can't
+        // collide mid-review. Read-only: writes only happen if the human clicks
+        // Mark Done / Post Comment in the rendered result (see renderQaTicketCheck).
+        const qaCheckBtn = container.querySelector('#qa-check-btn');
+        if (qaCheckBtn) {
+            qaCheckBtn.addEventListener('click', async () => {
+                const ctx = window.devopsContext || {};
+                const target = container.querySelector('#qa-results');
+                const ticketId = container.querySelector('#qa-ticket-id')?.value.trim();
+                if (!ctx.project) {
+                    target.innerHTML = `<p style="color:#ef4444; font-size:13px;">No Azure project selected — use the Project dropdown above.</p>`;
+                    return;
+                }
+                if (!ticketId) {
+                    target.innerHTML = `<p style="color:#ef4444; font-size:13px;">Enter an Azure ticket ID.</p>`;
+                    return;
+                }
+                qaCheckBtn.disabled = true;
+                qaCheckBtn.textContent = '⏳ Checking...';
+                target.innerHTML = '';
+                try {
+                    const resp = await fetch('/api/agent/qa_check_ticket', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ project: ctx.project, ticket_id: ticketId })
+                    });
+                    const result = await resp.json();
+                    if (result.success) {
+                        this.renderQaTicketCheck(container, result.result, ctx.project);
+                    } else {
+                        target.innerHTML = `<p style="color:#ef4444; font-size:13px;">❌ ${this.utils.escapeHtml(result.error || 'Check failed')}</p>`;
+                    }
+                } catch (err) {
+                    target.innerHTML = `<p style="color:#ef4444; font-size:13px;">❌ ${this.utils.escapeHtml(err.message)}</p>`;
+                } finally {
+                    qaCheckBtn.disabled = false;
+                    qaCheckBtn.textContent = '🔍 Check Ticket';
+                }
+            });
+        }
+
+        // Handler: QA Bulk Run — load tickets tagged 'qa', then run Agent 4 on selected
+        const qaBulkLoadBtn = container.querySelector('#qa-bulk-load-btn');
+        const qaBulkRunBtn  = container.querySelector('#qa-bulk-run-btn');
+        const qaBulkList    = container.querySelector('#qa-bulk-list');
+        const qaBulkResults = container.querySelector('#qa-bulk-results');
+
+        if (qaBulkLoadBtn) {
+            qaBulkLoadBtn.addEventListener('click', async () => {
+                const ctx = window.devopsContext || {};
+                const project = ctx.project || '';
+                if (!project) {
+                    qaBulkList.innerHTML = '<p style="color:#ef4444; font-size:13px;">No Azure project selected — use the Project dropdown above.</p>';
+                    return;
+                }
+                qaBulkLoadBtn.disabled = true;
+                qaBulkLoadBtn.textContent = '⏳ Loading...';
+                try {
+                    const resp = await fetch(`/api/agent/qa_tickets_by_tag?project=${encodeURIComponent(project)}`);
+                    const data = await resp.json();
+                    if (!data.success) {
+                        qaBulkList.innerHTML = `<p style="color:#ef4444; font-size:13px;">❌ ${this.utils.escapeHtml(data.error || 'Load failed')}</p>`;
+                        return;
+                    }
+                    if (data.tickets.length === 0) {
+                        qaBulkList.innerHTML = '<p style="color:#9ca3af; font-size:13px;">No tickets tagged <code>qa</code> found.</p>';
+                        qaBulkRunBtn.style.display = 'none';
+                        return;
+                    }
+                    qaBulkList.innerHTML = data.tickets.map(t => `
+                        <label style="display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #374151; font-size:13px; color:#e5e7eb; cursor:pointer;">
+                            <input type="checkbox" class="qa-bulk-checkbox" data-id="${t.ticket_id}" checked style="cursor:pointer;">
+                            <a href="${t.ticket_url}" target="_blank" style="color:#3b82f6; text-decoration:none; flex-shrink:0;">#${t.ticket_id}</a>
+                            <span style="color:#9ca3af; flex-shrink:0;">[${this.utils.escapeHtml(t.state)}]</span>
+                            <span>${this.utils.escapeHtml(t.title)}</span>
+                        </label>
+                    `).join('');
+                    qaBulkRunBtn.style.display = 'inline-block';
+                } catch (err) {
+                    qaBulkList.innerHTML = `<p style="color:#ef4444; font-size:13px;">❌ ${this.utils.escapeHtml(err.message)}</p>`;
+                } finally {
+                    qaBulkLoadBtn.disabled = false;
+                    qaBulkLoadBtn.textContent = 'Load tagged Tickets';
+                }
+            });
+        }
+
+        if (qaBulkRunBtn) {
+            qaBulkRunBtn.addEventListener('click', async () => {
+                const ctx = window.devopsContext || {};
+                const project = ctx.project || '';
+                const checkedIds = Array.from(container.querySelectorAll('.qa-bulk-checkbox:checked')).map(cb => parseInt(cb.dataset.id));
+                if (checkedIds.length === 0) {
+                    qaBulkResults.innerHTML = '<p style="color:#f59e0b; font-size:13px;">No tickets selected.</p>';
+                    return;
+                }
+                qaBulkRunBtn.disabled = true;
+                qaBulkRunBtn.textContent = `⏳ Running QA on ${checkedIds.length} ticket(s)…`;
+                qaBulkResults.innerHTML = '';
+                try {
+                    await fetch('/api/agent/qa_bulk_run', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ticket_ids: checkedIds, project })
+                    });
+                    const poll = setInterval(async () => {
+                        try {
+                            const r = await fetch('/api/agent/qa_bulk_results');
+                            const d = await r.json();
+                            if (d.ready && d.results) {
+                                clearInterval(poll);
+                                qaBulkRunBtn.disabled = false;
+                                qaBulkRunBtn.textContent = '✅ Run QA on Selected';
+                                qaBulkResults.innerHTML = d.results.map(res => {
+                                    const link = res.ticket_url
+                                        ? `<a href="${res.ticket_url}" target="_blank" style="color:#3b82f6; text-decoration:none;">#${res.ticket_id}</a>`
+                                        : `#${res.ticket_id}`;
+                                    if (res.status === 'done')
+                                        return `<div style="padding:5px 0; font-size:13px; color:#10b981;">✅ ${link} — resolved, marked Done</div>`;
+                                    if (res.status === 'still_present')
+                                        return `<div style="padding:5px 0; font-size:13px; color:#f59e0b;">⚠️ ${link} — still present, comment posted</div>`;
+                                    return `<div style="padding:5px 0; font-size:13px; color:#9ca3af;">⏭️ ${link} — skipped: ${this.utils.escapeHtml(res.reason || '')}</div>`;
+                                }).join('');
+                            }
+                        } catch (_) {}
+                    }, 3000);
+                } catch (err) {
+                    qaBulkRunBtn.disabled = false;
+                    qaBulkRunBtn.textContent = '✅ Run QA on Selected';
+                    qaBulkResults.innerHTML = `<p style="color:#ef4444; font-size:13px;">❌ ${this.utils.escapeHtml(err.message)}</p>`;
+                }
+            });
+        }
 
         // Handler 1: Run Agent button
         let _triageIssues = [];
@@ -635,6 +772,149 @@ LibreCrawlPlugin.register({
                 <div id="agent-ticket-list" style="max-height: 300px; overflow-y: auto;"></div>
             </div>
             </div>`;
+    },
+
+    renderQaBulkPanel() {
+        return `
+            <div id="pd-qa-bulk-panel" style="background: #1f2937; padding: 20px; border-radius: 12px; border: 1px solid #374151; margin-bottom: 32px;">
+                <h3>🚦 QA Bulk Run (Agent 4 — batch)</h3>
+                <p style="color: #9ca3af; font-size: 14px;">
+                    Loads all Azure tickets tagged <strong style="color:#e5e7eb;">qa-agent</strong>. Select any to run Agent 4 across them in one go —
+                    resolved tickets are marked Done automatically; still-present ones get a comment posted. No per-ticket clicks required.
+                </p>
+                <button id="qa-bulk-load-btn" style="background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-bottom: 14px;">
+                    Load tagged Tickets
+                </button>
+                <div id="qa-bulk-list"></div>
+                <button id="qa-bulk-run-btn" style="display:none; background: linear-gradient(135deg, #10b981 0%, #047857 100%); color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 12px;">
+                    ✅ Run QA on Selected
+                </button>
+                <div id="qa-bulk-results" style="margin-top: 16px;"></div>
+            </div>
+        `;
+    },
+
+    renderQaPanel() {
+        return `
+            <div id="pd-qa-panel" style="background: #1f2937; padding: 20px; border-radius: 12px; border: 1px solid #374151; margin-bottom: 32px;">
+                <h3>🔎 QA Recheck (Agent 4)</h3>
+                <p style="color: #9ca3af; font-size: 14px;">
+                    Look up one Azure ticket by ID — must be in the QA state. Agent 4 recovers the URL/issue from the
+                    ticket itself and re-checks it against its Acceptance Criteria, but only ever shows you the
+                    finding; nothing writes to Azure until you click Mark Done or Post Comment yourself.
+                </p>
+                <div style="display:flex; gap:8px; margin-top:12px;">
+                    <input id="qa-ticket-id" type="text" placeholder="Azure Ticket ID…" style="background:#0f172a; color:#e5e7eb; border:1px solid #374151; padding:8px 10px; border-radius:6px; font-size:13px; width:160px;">
+                    <button id="qa-check-btn" style="background: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%); color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 14px; cursor: pointer;">
+                        🔍 Check Ticket
+                    </button>
+                </div>
+                <div id="qa-results" style="margin-top: 16px;"></div>
+            </div>
+        `;
+    },
+
+    renderQaTicketCheck(container, result, project) {
+        const target = container.querySelector('#qa-results');
+        if (!target) return;
+
+        if (result.error) {
+            target.innerHTML = `
+                <div style="padding:10px; background:#0f172a; border-left:3px solid #ef4444; border-radius:4px; font-size:13px;">
+                    <a href="${result.ticket_url}" target="_blank" style="color:#3b82f6; text-decoration:none; font-weight:600;">#${result.ticket_id}</a>
+                    ${result.title ? ` — ${this.utils.escapeHtml(result.title)}` : ''}
+                    <div style="color:#ef4444; margin-top:4px;">❌ ${this.utils.escapeHtml(result.error)}</div>
+                </div>
+            `;
+            return;
+        }
+
+        const bannerColor = result.still_present ? '#ef4444' : '#10b981';
+        const bannerText  = result.still_present ? '❌ Issue still detected' : '✅ Issue no longer detected';
+        const draftComment = result.ai_how_to_fix
+            ? `Still detected: '${result.issue}'. Suggested fix:\n${result.ai_how_to_fix}`
+            : `Still detected: '${result.issue}' on ${result.url}.`;
+
+        target.innerHTML = `
+            <div style="padding:12px; background:#0f172a; border-radius:8px; border:1px solid #374151;">
+                <div style="margin-bottom:8px;">
+                    <a href="${result.ticket_url}" target="_blank" style="color:#3b82f6; text-decoration:none; font-weight:600;">#${result.ticket_id}</a>
+                    <span style="color:#cbd5e1; margin-left:8px;">${this.utils.escapeHtml(result.title)}</span>
+                </div>
+                <div style="color:#9ca3af; font-size:12px; margin-bottom:8px;">
+                    ${this.utils.escapeHtml(result.issue)} — <a href="${result.url}" target="_blank" style="color:#3b82f6; text-decoration:none;">${this.utils.escapeHtml(result.url)}</a>
+                </div>
+                <div style="background:#1f2937; padding:10px; border-radius:6px; margin-bottom:10px; font-size:12px; color:#cbd5e1;">
+                    <strong style="color:#e5e7eb;">Acceptance Criteria:</strong>
+                    <div style="margin-top:4px;">${result.acceptance_criteria || '<em style="color:#6b7280;">(none on this ticket)</em>'}</div>
+                </div>
+                <div style="color:${bannerColor}; font-weight:600; font-size:13px; margin-bottom:12px;">${bannerText}</div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-start;">
+                    <button id="qa-mark-done-btn" style="background:linear-gradient(135deg,#10b981 0%,#047857 100%); color:white; border:none; padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer;">
+                        ✅ Mark Done
+                    </button>
+                    <div style="flex:1; min-width:240px;">
+                        <textarea id="qa-comment-text" rows="3" style="width:100%; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:6px; padding:8px; font-size:12px; resize:vertical; box-sizing:border-box;">${this.utils.escapeHtml(draftComment)}</textarea>
+                        <button id="qa-comment-btn" style="background:linear-gradient(135deg,#f59e0b 0%,#b45309 100%); color:white; border:none; padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer; margin-top:6px;">
+                            💬 Post Comment
+                        </button>
+                    </div>
+                </div>
+                <div id="qa-action-status" style="margin-top:10px; font-size:12px;"></div>
+            </div>
+        `;
+
+        const statusEl = target.querySelector('#qa-action-status');
+
+        const markDoneBtn = target.querySelector('#qa-mark-done-btn');
+        if (markDoneBtn) {
+            markDoneBtn.addEventListener('click', async () => {
+                markDoneBtn.disabled = true;
+                markDoneBtn.textContent = '⏳...';
+                try {
+                    const resp = await fetch('/api/agent/qa_mark_done', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ project, ticket_id: result.ticket_id })
+                    });
+                    const r = await resp.json();
+                    statusEl.innerHTML = r.success
+                        ? `<span style="color:#10b981;">✅ Ticket #${result.ticket_id} marked Done.</span>`
+                        : `<span style="color:#ef4444;">❌ ${this.utils.escapeHtml(r.error || 'Failed to update ticket')}</span>`;
+                } catch (err) {
+                    statusEl.innerHTML = `<span style="color:#ef4444;">❌ ${this.utils.escapeHtml(err.message)}</span>`;
+                } finally {
+                    markDoneBtn.disabled = false;
+                    markDoneBtn.textContent = '✅ Mark Done';
+                }
+            });
+        }
+
+        const commentBtn = target.querySelector('#qa-comment-btn');
+        if (commentBtn) {
+            commentBtn.addEventListener('click', async () => {
+                const commentText = target.querySelector('#qa-comment-text')?.value.trim();
+                if (!commentText) return;
+                commentBtn.disabled = true;
+                commentBtn.textContent = '⏳...';
+                try {
+                    const resp = await fetch('/api/agent/qa_post_comment', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ project, ticket_id: result.ticket_id, comment: commentText })
+                    });
+                    const r = await resp.json();
+                    statusEl.innerHTML = r.success
+                        ? `<span style="color:#10b981;">✅ Comment posted on #${result.ticket_id}.</span>`
+                        : `<span style="color:#ef4444;">❌ ${this.utils.escapeHtml(r.error || 'Failed to post comment')}</span>`;
+                } catch (err) {
+                    statusEl.innerHTML = `<span style="color:#ef4444;">❌ ${this.utils.escapeHtml(err.message)}</span>`;
+                } finally {
+                    commentBtn.disabled = false;
+                    commentBtn.textContent = '💬 Post Comment';
+                }
+            });
+        }
     },
 
     renderAgentChecklist(container, issues) {

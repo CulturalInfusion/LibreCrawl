@@ -77,6 +77,11 @@ MAIN_APP_URL = os.getenv('MAIN_APP_URL', 'http://localhost:5000').rstrip('/')
 ANTHROPIC_EXPLAIN_MODEL = os.getenv('ANTHROPIC_EXPLAIN_MODEL', 'claude-haiku-4-5-20251001')
 OPENAI_EXPLAIN_MODEL = os.getenv('OPENAI_EXPLAIN_MODEL', 'gpt-3.5-turbo')
 
+AGENT2_ENABLED = os.getenv('AGENT2_ENABLED', 'true').lower() != 'false'
+AGENT3_ENABLED = os.getenv('AGENT3_ENABLED', 'true').lower() != 'false'
+AGENT4_ENABLED = os.getenv('AGENT4_ENABLED', 'true').lower() != 'false'
+AZURE_QA_TAG   = os.getenv('AZURE_QA_TAG', 'qa')
+
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
 
@@ -1851,9 +1856,12 @@ def devops_features():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 _agent_state = {}
+_qa_bulk_state = {'running': False, 'results': None}
 
 @app.route("/api/agent/start_workflow", methods=['POST'])
 def start_workflow():
+    if not AGENT2_ENABLED:
+        return jsonify({'success': False, 'error': 'Agent 2 (triage) is disabled — set AGENT2_ENABLED=true to enable.'}), 503
     global _agent_state
     data = request.get_json()
     _agent_state["url"]     = data.get("url")
@@ -1958,25 +1966,29 @@ def create_bulk_tickets():
             user_id=session.get('user_id')
         )
         if success:
-            try:
-                from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
-                fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
-                result['agent3_status'] = fix_result.get('status')
-                result['agent3_reason'] = fix_result.get('reason', '')
-                result['agent3_object_id'] = fix_result.get('object_id')
-                result['agent3_object_type'] = fix_result.get('object_type')
+            if not AGENT3_ENABLED:
+                result['agent3_status'] = 'disabled'
+                result['agent3_reason'] = 'Agent 3 is disabled — set AGENT3_ENABLED=true to enable auto-fix.'
+            else:
+                try:
+                    from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
+                    fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
+                    result['agent3_status'] = fix_result.get('status')
+                    result['agent3_reason'] = fix_result.get('reason', '')
+                    result['agent3_object_id'] = fix_result.get('object_id')
+                    result['agent3_object_type'] = fix_result.get('object_type')
 
-                if fix_result['status'] == 'fixed':
-                    qa_state = os.getenv('AZURE_QA_STATE', 'QA')
-                    result['agent3_qa_state'] = qa_state
-                    result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
-                    if fix_result.get('caveat'):
-                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
-                elif fix_result['status'] == 'deferred':
-                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
-            except Exception as e:
-                result['agent3_status'] = 'error'
-                result['agent3_reason'] = f'Agent 3 failed: {e}'
+                    if fix_result['status'] == 'fixed':
+                        qa_state = os.getenv('AZURE_QA_STATE', 'QA')
+                        result['agent3_qa_state'] = qa_state
+                        result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
+                        if fix_result.get('caveat'):
+                            result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
+                    elif fix_result['status'] == 'deferred':
+                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
+                except Exception as e:
+                    result['agent3_status'] = 'error'
+                    result['agent3_reason'] = f'Agent 3 failed: {e}'
 
             created.append(result)
         else:
@@ -1993,74 +2005,6 @@ def get_results():
         return jsonify({'ready': False})
     return jsonify({'ready': True, 'results': _agent_state.get("results", {})})
 
-@app.route("/api/agent/chat", methods=['POST'])
-def agent_chat():
-    provider = 'anthropic' if anthropic_client else 'openai' if openai_client else None
-    if provider is None:
-        return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
-
-    data    = request.get_json()
-    message = data.get('message', '')
-    issues  = data.get('issues', [])
-
-    issue_lines = '\n'.join(
-        f"{iss.get('issue','')} | {iss.get('url','')} | priority:{iss.get('priority','?')} | type:{iss.get('type','')}"
-        for iss in issues
-    )
-
-    prompt = f"""You are helping a developer triage SEO audit issues before creating tickets.
-
-Issue list (issue | url | priority | type):
-{issue_lines}
-
-User request: {message}
-
-First, write 1-2 sentences summarising what you found and listing the matched issue names.
-Then output a JSON block with the exact issue name and url for each match:
-{{"matches": [{{"issue": "exact issue name", "url": "exact url"}}]}}
-
-If all issues should be shown, include them all. Copy issue names and URLs exactly as written above. Always include the JSON block."""
-
-    try:
-        if provider == 'anthropic':
-            resp = anthropic_client.messages.create(
-                model=ANTHROPIC_EXPLAIN_MODEL,
-                system='You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.',
-                messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=1500,
-            )
-            text = resp.content[0].text
-        else:
-            resp = openai_client.chat.completions.create(
-                model=OPENAI_EXPLAIN_MODEL,
-                messages=[
-                    {'role': 'system', 'content': 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                max_tokens=1500,
-            )
-            text = resp.choices[0].message.content
-
-        json_match = re.search(r'\{\s*"matches"\s*:', text)
-        if json_match:
-            json_start = json_match.start()
-            json_end   = text.rfind('}') + 1
-            match_data = json.loads(text[json_start:json_end])
-            reply      = text[:json_start].strip()
-        else:
-            match_data = {'matches': []}
-            reply      = text.strip()
-
-        return jsonify({
-            'success': True,
-            'reply': reply,
-            'matches': match_data.get('matches', [])
-        })
-
-    except Exception as e:
-        print(f"[Chat] Error: {e}")
-        return jsonify({'success': False, 'error': 'Chat request failed'}), 500
-
 @app.route('/api/devops/identities', methods=['GET'])
 @login_required
 def devops_identities():
@@ -2110,227 +2054,158 @@ def devops_identities():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route("/api/agent/provider_options", methods=['GET'])
-def provider_options():
-    return jsonify({
-        'anthropic_available': bool(os.getenv('ANTHROPIC_API_KEY')),
-        'openai_available': bool(os.getenv('OPENAI_API_KEY')),
-        'current': get_provider()
-    })
-
-@app.route("/api/agent/set_provider", methods=['POST'])
-def set_provider():
-    data = request.get_json()
-    provider = data.get('provider')
-    if provider not in ('anthropic', 'openai'):
-        return jsonify({'success': False, 'error': 'Invalid provider'}), 400
-    if provider == 'anthropic' and not os.getenv('ANTHROPIC_API_KEY'):
-        return jsonify({'success': False, 'error': 'Anthropic API key not configured'}), 400
-    if provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
-        return jsonify({'success': False, 'error': 'OpenAI API key not configured'}), 400
-    set_provider_override(provider)
-    return jsonify({'success': True, 'provider': provider})
-
-@app.route('/api/devops/identities', methods=['GET'])
+@app.route("/api/agent/qa_check_ticket", methods=['POST'])
 @login_required
-def devops_identities():
-    org   = os.getenv('AZURE_DEVOPS_ORG')
-    pat   = os.getenv('AZURE_DEVOPS_PAT')
-    query = request.args.get('q', '').strip()
-    if not org or not pat:
-        return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG or AZURE_DEVOPS_PAT not configured'}), 400
-    if not query:
-        return jsonify({'success': True, 'members': []})
-
-    import base64
-    token   = base64.b64encode(f':{pat}'.encode()).decode()
-    headers = {
-        'Authorization': f'Basic {token}',
-        'Content-Type': 'application/json',
-        # IdentityPicker is an older internal API surface — api-version goes in the
-        # Accept header, not as a query param like every other Azure call in this
-        # file. Exact value verified via DevTools against a real org.
-        'Accept': 'application/json;api-version=5.0-preview.1;excludeUrls=true;enumsAsNumbers=true;msDateFormat=true;noArrayWrap=true',
-    }
-    url  = f'https://dev.azure.com/{org}/_apis/IdentityPicker/Identities'
-    body = {
-        'query': query,
-        'identityTypes': ['user', 'servicePrincipal'],
-        'operationScopes': ['ims', 'source'],
-        'options': {'MinResults': 5, 'MaxResults': 20},
-        'properties': ['DisplayName', 'SamAccountName', 'Active', 'SubjectDescriptor', 'Mail'],
-    }
+def agent_qa_check_ticket():
+    """Agent 4, read-only: look up one Azure ticket by ID, validate it's in
+    AZURE_QA_STATE, recheck its url, return findings for a human to act on.
+    Writes nothing — see qa_mark_done/qa_post_comment below."""
+    if not AGENT4_ENABLED:
+        return jsonify({'success': False, 'error': 'Agent 4 (QA) is disabled — set AGENT4_ENABLED=true to enable.'}), 503
+    data = request.get_json()
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    ticket_id = data.get('ticket_id')
+    if not project:
+        return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    if not ticket_id:
+        return jsonify({'success': False, 'error': 'No ticket ID provided.'}), 400
+    from src.agents.qa_agent import check_ticket
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        result = check_ticket(project, ticket_id)
+        return jsonify({'success': True, 'result': result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-        members = []
-        for result in data.get('results', []):
-            for identity in result.get('identities', []):
-                if identity.get('active') is False:
-                    continue
-                email = identity.get('mail') or identity.get('signInAddress') or identity.get('samAccountName', '')
-                if email:
-                    members.append({'email': email, 'name': identity.get('displayName', email)})
-        return jsonify({'success': True, 'members': members})
-    except requests.exceptions.HTTPError:
-        return jsonify({'success': False, 'error': f'Azure DevOps {resp.status_code}: {resp.text}'}), 500
+@app.route("/api/agent/qa_mark_done", methods=['POST'])
+@login_required
+def agent_qa_mark_done():
+    """Human clicked 'Mark Done' for a ticket Agent 4 confirmed as resolved."""
+    data = request.get_json()
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    ticket_id = data.get('ticket_id')
+    if not project or not ticket_id:
+        return jsonify({'success': False, 'error': 'project and ticket_id are required.'}), 400
+    from src.agents.qa_agent import mark_ticket_done
+    try:
+        ok = mark_ticket_done(project, ticket_id)
+        return jsonify({'success': ok})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route("/api/agent/qa_post_comment", methods=['POST'])
+@login_required
+def agent_qa_post_comment():
+    """Human clicked 'Post Comment' for a ticket still failing Agent 4's recheck."""
+    data = request.get_json()
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    ticket_id = data.get('ticket_id')
+    comment = data.get('comment', '').strip()
+    if not project or not ticket_id or not comment:
+        return jsonify({'success': False, 'error': 'project, ticket_id, and comment are required.'}), 400
+    from src.agents.qa_agent import post_qa_comment
+    try:
+        ok = post_qa_comment(project, ticket_id, comment)
+        return jsonify({'success': ok})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-_agent_state = {}
+def _run_qa_bulk(ticket_ids, project):
+    global _qa_bulk_state
+    from src.agents.qa_agent import check_ticket, mark_ticket_done, post_qa_comment
+    collected = []
+    try:
+        for tid in ticket_ids:
+            try:
+                result = check_ticket(project, int(tid))
+                ticket_url = result.get('ticket_url', '')
+                title = result.get('title', '')
+                if result.get('error'):
+                    collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'skipped', 'reason': result['error']})
+                elif not result.get('still_present'):
+                    mark_ticket_done(project, int(tid))
+                    collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'done'})
+                else:
+                    fix = result.get('ai_how_to_fix')
+                    comment = f"Still detected: '{result.get('issue')}'. Suggested fix:\n{fix}" if fix else f"Still detected: '{result.get('issue')}' on {result.get('url')}."
+                    post_qa_comment(project, int(tid), comment)
+                    collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'still_present'})
+            except Exception as e:
+                collected.append({'ticket_id': tid, 'ticket_url': '', 'title': '', 'status': 'skipped', 'reason': str(e)})
+    finally:
+        _qa_bulk_state = {'running': False, 'results': collected}
 
-@app.route("/api/agent/start_workflow", methods=['POST'])
-def start_workflow():
-    global _agent_state
-    data = request.get_json()
-    _agent_state["url"]     = data.get("url")
-    _agent_state["project"] = data.get("project")
-    _agent_state["feature"] = data.get("feature")
-    _agent_state["status"]  = "Workflow started"
-    _agent_state["issues"]  = data.get("issues", [])
-    _agent_state["results"] = None
 
-    issues = _agent_state["issues"]
-    thread = threading.Thread(target=run_triage_agent, args=(issues,), daemon=True)
-    thread.start()
-
-    return jsonify({'success': True})
-
-@app.route("/api/agent/workflow_trigger", methods=['GET'])
-def workflow_trigger():
-    global _agent_state
-    if _agent_state.get("status") != "Workflow started":
-        return jsonify({'success': False, 'error': 'No active workflow'}), 400
-    
-    _agent_state["status"] = "Crawling"
-
-    return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature"), 'issues': _agent_state.get("issues", [])})
-
-@app.route("/api/agent/triage", methods=['POST'])
-def agent_triage():
-    global _agent_state
-    data = request.get_json()
-    _agent_state["triage"] = data.get("issues", [])
-    _agent_state["status"] = "Triage ready"
-    return jsonify({'success': True})
-
-@app.route("/api/agent/triage", methods=['GET'])
-def get_triage():
-    global _agent_state
-    if _agent_state.get("status") != "Triage ready":
-        return jsonify({'success': False, 'error': 'Triage not ready'}), 400
-    return jsonify({'success': True, 'issues': _agent_state.get("triage", [])})
-
-@app.route("/api/agent/approval", methods=['POST'])
-def agent_approval():
-    global _agent_state
-    data = request.get_json()
-    _agent_state["approval"] = data.get("approval", [])
-    _agent_state["status"] = "Approval received"
-    return jsonify({'success': True})
-
-@app.route("/api/agent/approval", methods=['GET'])
-def get_approval():
-    global _agent_state
-    if _agent_state.get("status") != "Approval received":
-        return jsonify({'success': False, 'error': 'Approval not received'}), 400
-    return jsonify({'success': True, 'approval': _agent_state.get("approval", [])})
-
-@app.route("/api/agent/create_bulk_tickets", methods=['POST'])
-def create_bulk_tickets():
-    global _agent_state
-    data      = request.get_json()
-    approved  = data.get("approved", [])
-    project   = _agent_state.get("project", "")
-    parent_id = _agent_state.get("feature", "")
-
-    import base64 as _b64
-    from src.crawl_db import get_tickets_for_issues
-
-    created = []
-    errors  = []
-
-    # Generate cache_keys matching the JS formula used by the plugin:
-    # 'ai_' + btoa(unescape(encodeURIComponent(url+'|'+issue))).replace(/[=+/]/g, '')
-    # Python equivalent: base64(utf-8 bytes), strip =, +, /
-    def _cache_key(u, iss):
-        raw = (u + '|' + iss).encode('utf-8')
-        return 'ai_' + _b64.b64encode(raw).decode('ascii').replace('=', '').replace('+', '').replace('/', '')
-
-    pairs    = [{'url': i.get('url',''), 'issue': i.get('issue',''), 'cache_key': _cache_key(i.get('url',''), i.get('issue',''))} for i in approved]
-    existing = get_tickets_for_issues(pairs)
-
-    for i, issue in enumerate(approved):
-        url        = issue.get("url", "")
-        issue_name = issue.get("issue", "")
-        ck         = pairs[i]['cache_key']
-
-        if ck in existing:
-            t = existing[ck]
-            created.append({
-                'ticket_id': t.get('ticket_id'),
-                'ticket_url': t.get('ticket_url'),
-                'title': issue_name,
-                'skipped': True,
-                'agent3_status': 'skipped',
-                'agent3_reason': 'ticket already exists'
+@app.route("/api/agent/qa_tickets_by_tag", methods=['GET'])
+@login_required
+def qa_tickets_by_tag():
+    """Fetch all Azure tickets tagged 'qa' for the bulk QA run checklist."""
+    import base64
+    from urllib.parse import quote as url_quote
+    project = request.args.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    if not project:
+        return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    org = os.getenv('AZURE_DEVOPS_ORG')
+    if not org:
+        return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG not configured.'}), 500
+    pat = os.getenv('AZURE_DEVOPS_PAT')
+    try:
+        token = base64.b64encode(f':{pat}'.encode()).decode()
+        headers = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}
+        wiql_url = f'https://dev.azure.com/{org}/{url_quote(project)}/_apis/wit/wiql?api-version=7.1'
+        resp = requests.post(wiql_url, headers=headers, json={"query": f"SELECT [System.Id] FROM WorkItems WHERE [System.Tags] CONTAINS '{AZURE_QA_TAG}' ORDER BY [System.Id] DESC"}, timeout=10)
+        resp.raise_for_status()
+        work_items = resp.json().get('workItems', [])
+        if not work_items:
+            return jsonify({'success': True, 'tickets': []})
+        ids = ','.join(str(w['id']) for w in work_items)
+        fields = 'System.Id,System.Title,System.State,System.Tags'
+        batch_url = f'https://dev.azure.com/{org}/{url_quote(project)}/_apis/wit/workitems?ids={ids}&fields={fields}&api-version=7.1'
+        resp2 = requests.get(batch_url, headers=headers, timeout=10)
+        resp2.raise_for_status()
+        tickets = []
+        for item in resp2.json().get('value', []):
+            f = item.get('fields', {})
+            tid = item['id']
+            tickets.append({
+                'ticket_id': tid,
+                'title': f.get('System.Title', ''),
+                'state': f.get('System.State', ''),
+                'tags': f.get('System.Tags', ''),
+                'ticket_url': f'https://dev.azure.com/{org}/{url_quote(project)}/_workitems/edit/{tid}'
             })
-            continue
+        return jsonify({'success': True, 'tickets': tickets})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-        success, result = _create_single_ticket(
-            url,
-            issue_name,
-            issue.get("category", ""),
-            issue.get("type", "warning"),
-            issue.get("explanation", ""),
-            issue.get("how_to_fix", ""),
-            issue.get("priority", "medium"),
-            issue.get("role", ""),
-            project,
-            parent_id,
-            assignee=issue.get("assignee") or None,
-            user_id=session.get('user_id')
-        )
-        if success:
-            try:
-                from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
-                fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
-                result['agent3_status'] = fix_result.get('status')
-                result['agent3_reason'] = fix_result.get('reason', '')
-                result['agent3_object_id'] = fix_result.get('object_id')
-                result['agent3_object_type'] = fix_result.get('object_type')
 
-                if fix_result['status'] == 'fixed':
-                    qa_state = os.getenv('AZURE_QA_STATE', 'QA')
-                    result['agent3_qa_state'] = qa_state
-                    result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
-                    if fix_result.get('caveat'):
-                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
-                elif fix_result['status'] == 'deferred':
-                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
-            except Exception as e:
-                # Ticket was already created in Azure above — don't let a downstream
-                # Agent 3 failure (e.g. WordPress unreachable) drop the whole batch.
-                result['agent3_status'] = 'error'
-                result['agent3_reason'] = f'Agent 3 failed: {e}'
+@app.route("/api/agent/qa_bulk_run", methods=['POST'])
+@login_required
+def qa_bulk_run():
+    """Start a background bulk QA check on the given ticket IDs (tagged with AZURE_QA_TAG).
+    Auto-marks resolved tickets Done; posts a comment on still-present ones."""
+    if not AGENT4_ENABLED:
+        return jsonify({'success': False, 'error': 'Agent 4 (QA) is disabled — set AGENT4_ENABLED=true to enable.'}), 503
+    global _qa_bulk_state
+    if _qa_bulk_state.get('running'):
+        return jsonify({'success': False, 'error': 'QA bulk run already in progress.'}), 409
+    data = request.get_json()
+    ticket_ids = data.get('ticket_ids', [])
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    if not ticket_ids:
+        return jsonify({'success': False, 'error': 'No ticket IDs provided.'}), 400
+    if not project:
+        return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    _qa_bulk_state = {'running': True, 'results': None}
+    threading.Thread(target=_run_qa_bulk, args=(ticket_ids, project), daemon=True).start()
+    return jsonify({'queued': True})
 
-            created.append(result)
-        else:
-            errors.append({**result, 'url': url})
 
-    _agent_state["results"] = {"created": created, "errors": errors}
-    _agent_state["status"]  = "Completed"
-    return jsonify({'success': True, 'created': created, 'errors': errors})
+@app.route("/api/agent/qa_bulk_results", methods=['GET'])
+@login_required
+def qa_bulk_results():
+    return jsonify({'ready': not _qa_bulk_state.get('running', False), 'results': _qa_bulk_state.get('results')})
 
-@app.route("/api/agent/results", methods=['GET'])
-def get_results():
-    global _agent_state
-    if _agent_state.get("status") != "Completed":
-        return jsonify({'ready': False})
-    return jsonify({'ready': True, 'results': _agent_state.get("results", {})})
 
 @app.route("/api/agent/provider_options", methods=['GET'])
 def provider_options():
