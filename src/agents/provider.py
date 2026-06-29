@@ -1,8 +1,10 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # Reasoning-quality models for the agentic loop.
-ANTHROPIC_MODEL = 'claude-sonnet-4-6'
-OPENAI_MODEL    = 'gpt-4o'
+ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-6')
+OPENAI_MODEL    = os.getenv('OPENAI_MODEL', 'gpt-4o')
 
 _provider_override = None
 
@@ -10,17 +12,10 @@ def _env(name):
     return (os.getenv(name) or '').strip()
 
 def set_provider_override(provider):
-    """Set the user-selected provider ('anthropic' or 'openai'), or None to clear it."""
     global _provider_override
     _provider_override = provider
 
 def get_provider():
-    """Returns which AI provider to use.
-
-    If the user has picked one via set_provider_override(), that wins.
-    Otherwise falls back to auto-detect based on available API keys
-    (Anthropic first, then OpenAI).
-    """
     if _provider_override:
         return _provider_override
     if _env('ANTHROPIC_API_KEY'):

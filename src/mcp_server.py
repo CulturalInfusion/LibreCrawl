@@ -1,8 +1,19 @@
 from mcp.server.fastmcp import FastMCP
+<<<<<<< HEAD
 import requests
 http_session = requests.Session()
 
 BASE_URL = 'http://localhost:5000'  
+=======
+import os
+import requests
+from dotenv import load_dotenv
+load_dotenv()
+
+http_session = requests.Session()
+
+BASE_URL = os.getenv('MCP_BASE_URL', 'http://localhost:5000')
+>>>>>>> main
 mcp = FastMCP("LibreCrawl")
 
 @mcp.tool()
