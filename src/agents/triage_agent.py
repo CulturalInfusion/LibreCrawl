@@ -38,21 +38,43 @@ def explain(issue):
     return {**issue, **explanation}
 
 def triage_issues(issues):
-    """Call explain_issue for every non-info issue, sort by severity, return ranked list.
+    """Call explain_issue once per unique (issue, category) pair, then apply to all matching issues.
     Returns list of dicts: {url, issue, category, type, priority, explanation, how_to_fix, role}
-    Reference: main.py POST /api/explain_issue (line 1528) for response shape
-    WordPress constraint: explain_issue prompt already handles this server-side.
     Sort order: errors first, then warnings. Within each group, 'high' priority before 'medium'/'low'.
     """
-    ranked = []
+    filtered = [i for i in issues if i['type'] != 'info']
+    if not filtered:
+        return []
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(explain, issue) for issue in issues if issue['type'] != 'info']
+    # Collect one representative per unique (issue, category) — explanation is type-level, not URL-specific.
+    unique_pairs = {}
+    for i in filtered:
+        key = (i['issue'], i['category'])
+        if key not in unique_pairs:
+            unique_pairs[key] = i
+
+    explanations = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {
+            executor.submit(
+                explain_issue,
+                rep['url'], rep['issue'], rep['category'], rep['details']
+            ): key
+            for key, rep in unique_pairs.items()
+        }
         for future in as_completed(futures):
-            ranked.append(future.result())
-    
+            key = futures[future]
+            try:
+                explanations[key] = future.result()
+            except Exception as e:
+                print(f"explain_issue error for {key}: {e}")
+                explanations[key] = {}
+
+    ranked = [{**issue, **explanations.get((issue['issue'], issue['category']), {})}
+              for issue in filtered]
+
     priority_order = {'high': 0, 'medium': 1, 'low': 2}
-    ranked = sorted(ranked, key=lambda issue: priority_order.get(issue.get('priority', 'low'), 2))
+    ranked = sorted(ranked, key=lambda i: priority_order.get(i.get('priority', 'low'), 2))
     return ranked
 
 

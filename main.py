@@ -261,25 +261,32 @@ instances_lock = threading.Lock()
 
 def get_or_create_crawler():
     """Get or create a crawler instance for the current session"""
-    # Get or create session ID
     if 'session_id' not in session:
         session['session_id'] = str(uuid.uuid4())
 
     session_id = session['session_id']
-    user_id = session.get('user_id')  # Get user_id from session
-    tier = session.get('tier', 'guest')  # Get tier from session
+    user_id = session.get('user_id')
+    tier = session.get('tier', 'guest')
 
     with instances_lock:
-        # Check if crawler exists for this session
         if session_id not in crawler_instances:
+            # Before creating a blank instance, adopt any crawl that is still running.
+            # This handles the case where the app restarted and the session cookie was
+            # invalidated, leaving a live crawl thread orphaned under a different session_id.
+            for existing_id, instance in crawler_instances.items():
+                if instance['crawler'].is_running:
+                    session['session_id'] = existing_id
+                    instance['last_accessed'] = datetime.now()
+                    print(f"Session {session_id} adopted running crawl from session {existing_id}")
+                    return instance['crawler']
+
             print(f"Creating new crawler instance for session: {session_id}, user: {user_id}, tier: {tier}")
             crawler_instances[session_id] = {
                 'crawler': WebCrawler(),
-                'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),  # Per-user settings
+                'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),
                 'last_accessed': datetime.now()
             }
         else:
-            # Update last accessed time
             crawler_instances[session_id]['last_accessed'] = datetime.now()
 
         return crawler_instances[session_id]['crawler']
