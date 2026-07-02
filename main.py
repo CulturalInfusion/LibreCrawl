@@ -1972,7 +1972,7 @@ def create_bulk_tickets():
                     result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
                     if fix_result.get('caveat'):
                         result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
-                elif fix_result['status'] == 'deferred':
+                elif fix_result['status'] in ('skipped', 'error'):
                     result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
             except Exception as e:
                 result['agent3_status'] = 'error'
