@@ -1,3 +1,10 @@
+"""
+Agent 1 — Crawl.
+Triggered by: supervisor clicking "Run Agent" in the browser UI.
+Input: target URL from the workflow trigger. Output: full list of crawl issues passed
+to Agent 2 for triage.
+Does NOT create tickets or apply fixes — discovery only.
+"""
 import time
 from src.mcp_server import (
     poll_workflow_trigger,   # GET /api/agent/workflow_trigger

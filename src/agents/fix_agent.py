@@ -1,3 +1,11 @@
+"""
+Agent 3 — Fix.
+Triggered by: supervisor clicking "Run Agent 3" on an Azure DevOps ticket.
+Input: Azure ticket ID. Output: SEO fix applied to the WordPress site via WP REST API,
+ticket state updated, or deferral comment posted if the fix can't be automated.
+Requires: RankMath plugin active on the target site for most FIX_MAP entries.
+Does NOT verify that the fix worked — that is Agent 4's job.
+"""
 import os
 import base64
 import requests
