@@ -345,6 +345,7 @@ LibreCrawlPlugin.register({
                                         return `<div style="padding:5px 0; font-size:13px; color:#f59e0b;">⚠️ ${link} — still present, comment posted</div>`;
                                     return `<div style="padding:5px 0; font-size:13px; color:#9ca3af;">⏭️ ${link} — skipped: ${this.utils.escapeHtml(res.reason || '')}</div>`;
                                 }).join('');
+                                this.renderTokenLog(container, 'agent4');
                             }
                         } catch (_) {}
                     }, 3000);
@@ -367,6 +368,7 @@ LibreCrawlPlugin.register({
                 runBtn.disabled = true;
                 container.querySelector('#agent-idle').style.display = 'none';
                 container.querySelector('#agent-running').style.display = 'block';
+                this.renderTokenLog(container, ['agent2', 'agent3']);
 
                 await fetch('/api/agent/start_workflow', {
                     method: 'POST',
@@ -375,6 +377,7 @@ LibreCrawlPlugin.register({
                 });
 
                 const poll = setInterval(async () => {
+                    this.renderTokenLog(container, ['agent2', 'agent3']);  // Agent 2's explain calls happen during this wait — keep the log live
                     const resp = await fetch('/api/agent/triage');
                     if (resp.ok) {
                         const result = await resp.json();
@@ -420,6 +423,7 @@ LibreCrawlPlugin.register({
                     `Creating tickets for ${approved.length} issue(s). Please wait...`;
 
                 const poll = setInterval(async () => {
+                    this.renderTokenLog(container, ['agent2', 'agent3']);  // Agent 3's fix calls happen during this wait — keep the log live
                     const resp = await fetch('/api/agent/results');
                     if (!resp.ok) return;
                     const result = await resp.json();
@@ -428,10 +432,21 @@ LibreCrawlPlugin.register({
                         container.querySelector('#agent-running').style.display = 'none';
                         container.querySelector('#agent-done').style.display = 'block';
                         this.renderTicketResults(container, result.results);
+                        this.renderTokenLog(container, ['agent2', 'agent3']);
                     }
                 }, 3000);
             });
         }
+
+        // Handler: token log refresh buttons. Agent 2/3's shared panel already
+        // updates live on each poll tick above; this button is for re-checking
+        // after everything's settled. Agent 4's panel is manual-only (no live
+        // poll tied to it beyond the QA bulk run completion).
+        [['agent2', 'agent3'], ['agent4']].forEach(agents => {
+            const id = agents.join('_');
+            const btn = container.querySelector(`#${id}-token-refresh`);
+            if (btn) btn.addEventListener('click', () => this.renderTokenLog(container, agents));
+        });
 
         // Handler 3: Chat send
         const chatSend  = container.querySelector('#agent-chat-send');
@@ -739,6 +754,13 @@ LibreCrawlPlugin.register({
                 <p style="color: #9ca3af; font-size: 14px; margin-bottom: 12px;">Agent is running: crawling, triaging, and creating tickets. Please wait...</p>
             </div>
 
+            <!--Agent 2 (explain, during the first running wait) and Agent 3 (fix, during
+                the second) run one after another, never at once, so they share one live
+                token log here rather than each getting a separate panel. Sits outside the
+                idle/running/triage/done toggle divs above so it doesn't vanish when the
+                phase changes — only what's inside it updates.-->
+            ${this.renderTokenLogBlock(['agent2', 'agent3'], '🪙 Agent 2 & 3 — Token Usage')}
+
             <!--state: triage ready-->
             <div id="agent-triage" style="display:none;">
                 <h4 style="margin-bottom:12px;">Review Issues for Ticket Creation</h4>
@@ -774,6 +796,60 @@ LibreCrawlPlugin.register({
             </div>`;
     },
 
+    // Shared markup for a token-usage block covering one or more agents that share
+    // a panel (e.g. Agent 2 + 3, which run one after another, never at once) — a
+    // totals line plus a scrollable per-call log underneath, matching what already
+    // prints to docker logs. Populated by renderTokenLog() below.
+    renderTokenLogBlock(agents, title) {
+        const list = Array.isArray(agents) ? agents : [agents];
+        const id = list.join('_');
+        return `
+            <div style="margin-top:16px; padding-top:12px; border-top:1px solid #374151;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                    <h5 style="margin:0; font-size:13px; color:#9ca3af;">${title}</h5>
+                    <button id="${id}-token-refresh" style="background:#374151; color:#e5e7eb; border:none; padding:4px 10px; border-radius:4px; font-size:11px; cursor:pointer;">
+                        Refresh
+                    </button>
+                </div>
+                <p id="${id}-token-summary" style="color:#9ca3af; font-size:12px; margin:0 0 6px 0;"></p>
+                <div id="${id}-token-log" style="max-height:160px; overflow-y:auto; background:#111827; border:1px solid #374151; border-radius:6px; padding:8px;"></div>
+            </div>
+        `;
+    },
+
+    async renderTokenLog(container, agents) {
+        const list = Array.isArray(agents) ? agents : [agents];
+        const id = list.join('_');
+        const showAgentTag = list.length > 1;  // shared panels tag each line so agent2 vs agent3 calls stay distinguishable
+        const summaryEl = container.querySelector(`#${id}-token-summary`);
+        const logEl = container.querySelector(`#${id}-token-log`);
+        if (!summaryEl || !logEl) return;
+
+        try {
+            const resp = await fetch(`/api/agent/token_usage?agent=${list.join(',')}`);
+            const data = await resp.json();
+            if (!data.success) throw new Error(data.error || 'Failed to load token usage');
+
+            summaryEl.textContent = data.summary.length
+                ? data.summary.map(s =>
+                    `${showAgentTag ? s.agent + ' / ' : ''}${s.model}: ${s.calls} call${s.calls === 1 ? '' : 's'}, ${s.total_tokens.toLocaleString()} tokens ` +
+                    `(${s.input_tokens.toLocaleString()} in / ${s.output_tokens.toLocaleString()} out)`
+                  ).join('  ·  ')
+                : 'No calls recorded yet.';
+
+            logEl.innerHTML = data.log.length
+                ? data.log.map(e => `
+                    <div style="padding:4px 0; border-bottom:1px solid #374151; font-size:12px;">
+                        ${showAgentTag ? `<span style="color:#60a5fa; font-weight:600;">[${this.utils.escapeHtml(e.agent)}]</span> ` : ''}<span style="color:#e5e7eb;">${this.utils.escapeHtml(e.label || '(unlabeled)')}</span>
+                        <span style="color:#6b7280;"> — ${this.utils.escapeHtml(e.model)} — ${e.total_tokens.toLocaleString()} tok (${e.input_tokens}/${e.output_tokens})</span>
+                    </div>`).join('')
+                : '<p style="color:#9ca3af; font-size:12px; margin:0;">No calls recorded yet.</p>';
+        } catch (err) {
+            summaryEl.textContent = '';
+            logEl.innerHTML = `<p style="color:#ef4444; font-size:12px; margin:0;">Could not load token usage: ${this.utils.escapeHtml(err.message)}</p>`;
+        }
+    },
+
     renderQaBulkPanel() {
         return `
             <div id="pd-qa-bulk-panel" style="background: #1f2937; padding: 20px; border-radius: 12px; border: 1px solid #374151; margin-bottom: 32px;">
@@ -790,6 +866,8 @@ LibreCrawlPlugin.register({
                     ✅ Run QA on Selected
                 </button>
                 <div id="qa-bulk-results" style="margin-top: 16px;"></div>
+
+                ${this.renderTokenLogBlock('agent4', '🪙 Agent 4 — Token Usage')}
             </div>
         `;
     },

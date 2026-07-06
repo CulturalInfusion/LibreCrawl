@@ -82,8 +82,8 @@ def poll_workflow_trigger() -> dict:
     return response.json()
 
 @mcp.tool()
-def post_triage_results(issues: list) -> dict:
-    """Posts the results of a triage decision for a given issue."""
+def post_review_results(issues: list) -> dict:
+    """Posts the results of a review decision for a given issue."""
     response = http_session.post(f"{BASE_URL}/api/agent/triage", json={
         "issues": issues,
     })

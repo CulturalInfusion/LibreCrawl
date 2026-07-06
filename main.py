@@ -19,7 +19,7 @@ from functools import wraps
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
 from src.agents.ticket_review_agent import run_agentic as run_triage_agent
-from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL
+from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL, record_usage, get_usage_summary, get_usage_log
 from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, create_magic_link, verify_magic_link
 from src.email_service import send_verification_email, send_welcome_email, send_magic_link_email
 
@@ -1576,6 +1576,9 @@ def explain_issue():
         category = data.get('category', '')
         details = data.get('details', '')
         page_context = data.get('page_context', {})
+        # Defaults to agent2 (this route's usual caller); qa_agent.py passes
+        # 'agent4' so its calls don't get misattributed to Agent 2's token log.
+        caller_agent = data.get('agent', 'agent2')
 
         # Build context string from page data
         context_parts = []
@@ -1640,10 +1643,13 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             ai_response = json.loads(text[text.find('{'):text.rfind('}')+1])
 
         # Log token usage
+        explain_model = ANTHROPIC_EXPLAIN_MODEL if provider == 'anthropic' else OPENAI_EXPLAIN_MODEL
         if provider == 'anthropic':
-            tokens = response.usage.input_tokens + response.usage.output_tokens
+            input_tokens, output_tokens = response.usage.input_tokens, response.usage.output_tokens
         else:
-            tokens = response.usage.total_tokens
+            input_tokens, output_tokens = response.usage.prompt_tokens, response.usage.completion_tokens
+        tokens = input_tokens + output_tokens
+        record_usage(caller_agent, explain_model, input_tokens, output_tokens, label=issue)
         print(f"AI Explain - Tokens used: {tokens}")
 
         how_to_fix = ai_response.get('how_to_fix', '')
@@ -1657,7 +1663,7 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             'priority': ai_response.get('priority', 'medium'),
             'role': ai_response.get('role', ''),
             'tokens_used': tokens,
-            'model': ANTHROPIC_EXPLAIN_MODEL if provider == 'anthropic' else OPENAI_EXPLAIN_MODEL
+            'model': explain_model
         })
 
     except Exception as e:
@@ -2214,6 +2220,21 @@ def qa_bulk_results():
     return jsonify({'ready': not _qa_bulk_state.get('running', False), 'results': _qa_bulk_state.get('results')})
 
 
+@app.route("/api/agent/token_usage", methods=['GET'])
+@login_required
+def agent_token_usage():
+    """Token usage for one panel's worth of agents: aggregate totals (per agent/model)
+    plus the scrollable per-call log, newest first. ?agent=agent2,agent3 scopes both
+    (comma-separated for a panel shared by more than one agent); omit for everything."""
+    agent_param = request.args.get('agent')
+    agent = agent_param.split(',') if agent_param else None
+    return jsonify({
+        'success': True,
+        'summary': get_usage_summary(agent),
+        'log': get_usage_log(agent),
+    })
+
+
 @app.route("/api/agent/provider_options", methods=['GET'])
 def provider_options():
     return jsonify({
@@ -2234,74 +2255,6 @@ def set_provider():
         return jsonify({'success': False, 'error': 'OpenAI API key not configured'}), 400
     set_provider_override(provider)
     return jsonify({'success': True, 'provider': provider})
-
-@app.route("/api/agent/chat", methods=['POST'])
-def agent_chat():
-    provider = get_provider()
-    if provider is None:
-        return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
-
-    data    = request.get_json()
-    message = data.get('message', '')
-    issues  = data.get('issues', [])
-
-    issue_lines = '\n'.join(
-        f"{iss.get('issue','')} | {iss.get('url','')} | priority:{iss.get('priority','?')} | type:{iss.get('type','')}"
-        for iss in issues
-    )
-
-    prompt = f"""You are helping a developer triage SEO audit issues before creating tickets.
-
-Issue list (issue | url | priority | type):
-{issue_lines}
-
-User request: {message}
-
-First, write 1-2 sentences summarising what you found and listing the matched issue names.
-Then output a JSON block with the exact issue name and url for each match:
-{{"matches": [{{"issue": "exact issue name", "url": "exact url"}}]}}
-
-If all issues should be shown, include them all. Copy issue names and URLs exactly as written above. Always include the JSON block."""
-
-    try:
-        if provider == 'anthropic':
-            resp = anthropic_client.messages.create(
-                model=ANTHROPIC_MODEL,
-                system='You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.',
-                messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=4096,
-            )
-            text = resp.content[0].text
-        else:
-            resp = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {'role': 'system', 'content': 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                max_tokens=4096,
-            )
-            text = resp.choices[0].message.content
-
-        json_match = re.search(r'\{\s*"matches"\s*:', text)
-        if json_match:
-            json_start = json_match.start()
-            json_end   = text.rfind('}') + 1
-            match_data = json.loads(text[json_start:json_end])
-            reply      = text[:json_start].strip()
-        else:
-            match_data = {'matches': []}
-            reply      = text.strip()
-
-        return jsonify({
-            'success': True,
-            'reply': reply,
-            'matches': match_data.get('matches', [])
-        })
-
-    except Exception as e:
-        print(f"[Chat] Error: {e}")
-        return jsonify({'success': False, 'error': 'Chat request failed'}), 500
 
 def main():
     import signal
