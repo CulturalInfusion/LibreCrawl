@@ -7,6 +7,10 @@ load_dotenv()
 ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-6')
 OPENAI_MODEL    = os.getenv('OPENAI_MODEL', 'gpt-4o')
 
+# Fast/cheap models for explain-style calls (per-issue explanations, HITL chat filtering).
+ANTHROPIC_EXPLAIN_MODEL = os.getenv('ANTHROPIC_EXPLAIN_MODEL', 'claude-haiku-4-5-20251001')
+OPENAI_EXPLAIN_MODEL    = os.getenv('OPENAI_EXPLAIN_MODEL', 'gpt-3.5-turbo')
+
 _provider_override = None
 
 # Token usage tracking. In-memory only — same resets-on-restart pattern as
@@ -18,7 +22,7 @@ _provider_override = None
 # per-ticket detail underneath, mirroring what already prints to docker logs.
 _usage = {}
 _usage_log = []
-_USAGE_LOG_MAX = 500  # cap so a long-running container doesn't grow this unbounded
+_USAGE_LOG_MAX = int(os.getenv('USAGE_LOG_MAX', 500))  # cap so a long-running container doesn't grow this unbounded
 
 def record_usage(agent, model, input_tokens, output_tokens, label=''):
     entry = _usage.setdefault((agent, model), {'calls': 0, 'input_tokens': 0, 'output_tokens': 0})

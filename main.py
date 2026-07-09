@@ -19,7 +19,11 @@ from functools import wraps
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
 from src.agents.ticket_review_agent import run_agentic as run_triage_agent
-from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL, record_usage, get_usage_summary, get_usage_log
+from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL, ANTHROPIC_EXPLAIN_MODEL, OPENAI_EXPLAIN_MODEL, record_usage, get_usage_summary, get_usage_log
+from src.agents.prompts import (
+    build_explain_issue_prompt, EXPLAIN_ISSUE_SYSTEM_PROMPT,
+    build_agent_chat_prompt, AGENT_CHAT_SYSTEM_PROMPT,
+)
 from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, create_magic_link, verify_magic_link
 from src.email_service import send_verification_email, send_welcome_email, send_magic_link_email
 
@@ -74,8 +78,6 @@ DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'ye
 SKIP_AUTH = args.dangerously_skip_auth or os.getenv('DANGEROUSLY_SKIP_AUTH', '').lower() in ('true', '1', 'yes')
 ALLOWED_EMAIL_DOMAIN = os.getenv('ALLOWED_EMAIL_DOMAIN', '')
 MAIN_APP_URL = os.getenv('MAIN_APP_URL', 'http://localhost:5000').rstrip('/')
-ANTHROPIC_EXPLAIN_MODEL = os.getenv('ANTHROPIC_EXPLAIN_MODEL', 'claude-haiku-4-5-20251001')
-OPENAI_EXPLAIN_MODEL = os.getenv('OPENAI_EXPLAIN_MODEL', 'gpt-3.5-turbo')
 
 AGENT2_ENABLED = os.getenv('AGENT2_ENABLED', 'true').lower() != 'false'
 AGENT3_ENABLED = os.getenv('AGENT3_ENABLED', 'true').lower() != 'false'
@@ -1593,41 +1595,23 @@ def explain_issue():
 
         context_str = '\n'.join(context_parts) if context_parts else 'No additional context available'
 
-        # Build the prompt for OpenAI
-        prompt = f"""You are an SEO expert providing actionable advice. Analyze this specific issue:
+        # Prompt built in src/agents/prompts.py — see build_explain_issue_prompt()
+        prompt = build_explain_issue_prompt(url, issue, category, details, context_str)
 
-URL: {url}
-Issue: {issue}
-Category: {category}
-Details: {details}
-
-Page Context:
-{context_str}
-
-Provide a JSON response with exactly this structure:
-{{
-    "explanation": "2-3 sentence explanation of why this issue matters for SEO and user experience",
-    "how_to_fix": "Step-by-step fix instructions (3-5 bullet points, use markdown formatting with • for bullets)",
-    "priority": "high/medium/low based on SEO impact",
-    "role": "Most suitable role from this list only: Webmaster (SEO config, robots.txt, sitemaps, schema markup, indexability), Copywriter / Content Editor (written content, meta descriptions, social tags, OG metadata), Web Developer (code, performance, accessibility implementation, responsive design, ARIA), Designer (visual design, color contrast, typography, layout, UX)"
-}}
-
-Keep the explanation concise but specific to this URL. Use SEMRush-style actionable language."""
-
-        # Call OpenAI API
+        # Call Anthropic API
         if provider == 'anthropic':
             response = anthropic_client.messages.create(
                 model=ANTHROPIC_EXPLAIN_MODEL,
-                system='You are an SEO expert. Always respond with valid JSON.',
+                system=EXPLAIN_ISSUE_SYSTEM_PROMPT,
                 messages=[{'role': 'user', 'content': prompt}],
                 max_tokens=500,
             )
         else:
-        # Call Anthropic API
+        # Call OpenAI API
             response = openai_client.chat.completions.create(
             model=OPENAI_EXPLAIN_MODEL,
             messages=[
-                {'role': 'system', 'content': 'You are an SEO expert, specialized in WordPress websites. The URLs you crawl are Wordpress sites so all fix guidance must  reference WordPress-specific tooling: wp-admin, plugins, themes. Do not give generic CMS advice. Always respond with valid JSON.'},
+                {'role': 'system', 'content': EXPLAIN_ISSUE_SYSTEM_PROMPT},
                 {'role': 'user', 'content': prompt}
             ],
             max_tokens=500,
@@ -1997,7 +1981,7 @@ def create_bulk_tickets():
                         result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
                         if fix_result.get('caveat'):
                             result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
-                    elif fix_result['status'] == 'deferred':
+                    elif fix_result['status'] in ('skipped', 'error') and fix_result.get('reason'):
                         result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
                 except Exception as e:
                     result['agent3_status'] = 'error'
@@ -2255,6 +2239,68 @@ def set_provider():
         return jsonify({'success': False, 'error': 'OpenAI API key not configured'}), 400
     set_provider_override(provider)
     return jsonify({'success': True, 'provider': provider})
+
+@app.route("/api/agent/chat", methods=['POST'])
+def agent_chat():
+    provider = get_provider()
+    if provider is None:
+        return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
+
+    data    = request.get_json()
+    message = data.get('message', '')
+    issues  = data.get('issues', [])
+
+    issue_lines = '\n'.join(
+        f"{iss.get('issue','')} | {iss.get('url','')} | priority:{iss.get('priority','?')} | type:{iss.get('type','')}"
+        for iss in issues
+    )
+
+    # Prompt built in src/agents/prompts.py — see build_agent_chat_prompt()
+    prompt = build_agent_chat_prompt(issue_lines, message)
+
+    try:
+        if provider == 'anthropic':
+            resp = anthropic_client.messages.create(
+                model=ANTHROPIC_MODEL,
+                system=AGENT_CHAT_SYSTEM_PROMPT,
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=4096,
+            )
+            text = resp.content[0].text
+            input_tokens, output_tokens = resp.usage.input_tokens, resp.usage.output_tokens
+        else:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {'role': 'system', 'content': AGENT_CHAT_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': prompt}
+                ],
+                max_tokens=4096,
+            )
+            text = resp.choices[0].message.content
+            input_tokens, output_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
+
+        record_usage('agent2', ANTHROPIC_MODEL if provider == 'anthropic' else OPENAI_MODEL, input_tokens, output_tokens, label='agent_chat')
+
+        json_match = re.search(r'\{\s*"matches"\s*:', text)
+        if json_match:
+            json_start = json_match.start()
+            json_end   = text.rfind('}') + 1
+            match_data = json.loads(text[json_start:json_end])
+            reply      = text[:json_start].strip()
+        else:
+            match_data = {'matches': []}
+            reply      = text.strip()
+
+        return jsonify({
+            'success': True,
+            'reply': reply,
+            'matches': match_data.get('matches', [])
+        })
+
+    except Exception as e:
+        print(f"[Chat] Error: {e}")
+        return jsonify({'success': False, 'error': 'Chat request failed'}), 500
 
 def main():
     import signal

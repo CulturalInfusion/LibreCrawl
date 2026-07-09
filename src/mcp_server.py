@@ -83,8 +83,8 @@ def poll_workflow_trigger() -> dict:
 
 @mcp.tool()
 def post_review_results(issues: list) -> dict:
-    """Posts the results of a review decision for a given issue."""
-    response = http_session.post(f"{BASE_URL}/api/agent/triage", json={
+    """Posts the reviewd issue list to the browser for human review."""
+    response = http_session.post(f"{BASE_URL}/api/agent/review", json={
         "issues": issues,
     })
     return response.json()

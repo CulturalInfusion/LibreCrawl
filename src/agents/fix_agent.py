@@ -18,6 +18,7 @@ from src.agents.wordpress import (
     probe_site, ensure_plugin_active, create_redirect_rule, NAMESPACE_PLUGIN_MAP,
 )
 from src.agents.provider import call_with_tools
+from src.agents.prompts import build_plugin_decision_prompt, build_fix_title_prompt
 
 
 def _confirm_rendered(url, expected):
@@ -96,11 +97,7 @@ def decide_required_plugin(issue, active_namespaces):
     rather than triggering an install.
     """
     candidates = {ns: slug for ns, slug in NAMESPACE_PLUGIN_MAP.items() if ns in ('rankmath/v1', 'redirection/v1')}
-    prompt = (
-        f"Issue: '{issue}'. Site's currently active plugin REST namespaces: {active_namespaces}.\n"
-        f"Which plugin slug is needed to fix this issue? Valid answers, exactly as written, "
-        f"nothing else: {list(candidates.values())} or 'none'."
-    )
+    prompt = build_plugin_decision_prompt(issue, active_namespaces, list(candidates.values()))
     _, text, _, _ = call_with_tools([{'role': 'user', 'content': prompt}], [], agent="agent3", label=f"Plugin check — {issue}")
     answer = text.strip().strip("'\"")
     return answer if answer in candidates.values() else 'none'
@@ -163,12 +160,7 @@ def fix_title_core(ticket):
     suffix = current_title[current_title.rindex(' | '):] if ' | ' in current_title else ''
     budget = max(60 - len(suffix), 20)
     length = f"between 30 and {budget} characters" if 'Short' in ticket['issue'] else f"at most {budget} characters"
-    prompt = (
-        f"Write a single SEO page title, {length}, for this webpage.\n"
-        f"Current title (may be missing or the wrong length): {current_title}\n"
-        f"Main heading: {ctx['h1']}\nPage content excerpt: {ctx['body_excerpt']}\n"
-        f"Return only the title text, no quotes, no preamble, no partial words."
-    )
+    prompt = build_fix_title_prompt(length, current_title, ctx['h1'], ctx['body_excerpt'])
     _, text, _, _ = call_with_tools([{'role': 'user', 'content': prompt}], [], agent="agent3", label=ticket['issue'])
     title = text.strip()
     if len(title) > budget:
@@ -457,10 +449,10 @@ def add_ticket_comment(ticket_id, project, comment):
     try:
         resp = requests.post(api_url, headers=headers, json=body, timeout=10)
         resp.raise_for_status()
-        print(f"[Agent 3] Comment added to ticket {ticket_id}.")
+        print(f"[Ticket] Comment added to ticket {ticket_id}.")
         return True
     except Exception:
-        print(f"[Agent 3] Could not add comment to ticket {ticket_id} — request to Azure DevOps failed.")
+        print(f"[Ticket] Could not add comment to ticket {ticket_id} — request to Azure DevOps failed.")
         return False
 
 
@@ -483,8 +475,8 @@ def set_ticket_state(ticket_id, project, state):
     try:
         resp = requests.patch(api_url, headers=headers, json=body, timeout=10)
         resp.raise_for_status()
-        print(f"[Agent 3] Ticket {ticket_id} moved to '{state}'.")
+        print(f"[Ticket] Ticket {ticket_id} moved to '{state}'.")
         return True
     except Exception:
-        print(f"[Agent 3] Could not update ticket {ticket_id} state — request to Azure DevOps failed.")
+        print(f"[Ticket] Could not update ticket {ticket_id} state — request to Azure DevOps failed.")
         return False

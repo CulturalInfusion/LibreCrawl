@@ -16,7 +16,9 @@ from urllib.parse import quote
 from src.crawler import check_single_url
 from src.agents.fix_agent import set_ticket_state, add_ticket_comment
 
-BASE_URL = 'http://localhost:5000'
+# Reuses MCP_BASE_URL — src/mcp_server.py already owns this env var for the
+# identical self-referencing-local-API use case.
+BASE_URL = os.getenv('MCP_BASE_URL', 'http://localhost:5000')
 
 
 def _auth_headers():
