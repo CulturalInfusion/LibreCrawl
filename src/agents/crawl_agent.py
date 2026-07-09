@@ -2,7 +2,7 @@
 Agent 1 — Crawl.
 Triggered by: supervisor clicking "Run Agent" in the browser UI.
 Input: target URL from the workflow trigger. Output: full list of crawl issues passed
-to Agent 2 for triage.
+to Agent 2 for review.
 Does NOT create tickets or apply fixes — discovery only.
 """
 import time

@@ -1,5 +1,5 @@
 """
-Agent 2 — Ticket Review (Triage).
+Agent 2 — Ticket Review.
 Triggered by: Agent 1 completing a crawl and posting issues to the workflow queue.
 Input: list of crawl issues. Output: Azure DevOps tickets for human-approved issues.
 Flow: explain issues (parallel AI calls) → post to browser for review → poll for
@@ -112,7 +112,7 @@ def create_tickets(approved):
 def run(issues):
     """Main agent loop. Runs once per workflow trigger."""
     ranked = review_issues(issues)
-    print(f"[Agent] Triage complete. Posting digest ({len(ranked)} issues).")
+    print(f"[Agent] Review complete. Posting digest ({len(ranked)} issues).")
     post_review_results(ranked)
 
     print("[Agent] Waiting for human approval...")

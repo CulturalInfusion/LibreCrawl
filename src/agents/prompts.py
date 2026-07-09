@@ -66,7 +66,7 @@ EXPLAIN_ISSUE_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 
 def build_agent_chat_prompt(issue_lines, message):
-    return f"""You are helping a developer triage SEO audit issues before creating tickets.
+    return f"""You are helping a developer review SEO audit issues before creating tickets.
 
 Issue list (issue | url | priority | type):
 {issue_lines}
@@ -80,30 +80,29 @@ Then output a JSON block with the exact issue name and url for each match:
 If all issues should be shown, include them all. Copy issue names and URLs exactly as written above. Always include the JSON block."""
 
 
-AGENT_CHAT_SYSTEM_PROMPT = 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'
+AGENT_CHAT_SYSTEM_PROMPT = 'You are an SEO review assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'
 
 
 # ---------------------------------------------------------------------------
 # run_agentic() — src/agents/ticket_review_agent.py, the WordPress
-# ticket-triage agentic loop (select_issues -> post_triage_results ->
+# ticket-review agentic loop (select_issues -> post_review_results ->
 # poll_approval -> create_bulk_tickets).
 #
 # Used by: ticket_review_agent.py's run_agentic() only, passed as the
 # `system` argument to call_with_tools(messages, REVIEW_TOOLS, system).
-#
 # Pattern: static string, no interpolation, no JSON output — it drives a
 # strict 4-step tool-calling sequence. The tool names named in step 2
-# ("post_triage_results") and elsewhere must stay byte-identical to the
+# ("post_review_results") and elsewhere must stay byte-identical to the
 # `name` fields registered in src/agents/tools.py's REVIEW_TOOLS and to the
 # dispatch in ticket_review_agent.py's execute_tool()/dispatch() — those are
 # real function identifiers the model calls by name, not prose.
 # ---------------------------------------------------------------------------
 
 REVIEW_AGENT_SYSTEM_PROMPT = (
-    "You are an SEO triage agent for a WordPress website. "
+    "You are an SEO review agent for a WordPress website. "
     "Call these four tools in order — none require parameters:\n"
     "1. select_issues — explains the crawl issues and prepares them for review\n"
-    "2. post_triage_results — sends the list to the browser for human approval\n"
+    "2. post_review_results — sends the list to the browser for human approval\n"
     "3. poll_approval — a human is reviewing the issues in their browser and may take "
     "several minutes. Call this tool again every time it returns success=false, with "
     "no limit on how many attempts that takes. Never decide on your own that the human "

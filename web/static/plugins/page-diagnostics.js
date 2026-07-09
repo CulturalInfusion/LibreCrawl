@@ -358,7 +358,7 @@ LibreCrawlPlugin.register({
         }
 
         // Handler 1: Run Agent button
-        let _triageIssues = [];
+        let _reviewIssues = [];
         const runBtn = container.querySelector('#agent-run-btn');
         if (runBtn) {
             runBtn.addEventListener('click', async () => {
@@ -378,14 +378,14 @@ LibreCrawlPlugin.register({
 
                 const poll = setInterval(async () => {
                     this.renderTokenLog(container, ['agent2', 'agent3']);  // Agent 2's explain calls happen during this wait — keep the log live
-                    const resp = await fetch('/api/agent/triage');
+                    const resp = await fetch('/api/agent/review');
                     if (resp.ok) {
                         const result = await resp.json();
                         if (result.success) {
                             clearInterval(poll);
-                            _triageIssues = result.issues;
+                            _reviewIssues = result.issues;
                             container.querySelector('#agent-running').style.display = 'none';
-                            container.querySelector('#agent-triage').style.display = 'block';
+                            container.querySelector('#agent-review').style.display = 'block';
                             this.renderAgentChecklist(container, result.issues);
                             this.appendChatMessage(container,
                                 `I've analysed ${result.issues.length} issues. Ask me to filter by priority, type, URL pattern, or anything else — then tick the ones you want to action.`,
@@ -400,10 +400,10 @@ LibreCrawlPlugin.register({
         const approveBtn = container.querySelector('#agent-approve-btn');
         if (approveBtn) {
             approveBtn.addEventListener('click', async () => {
-                const checked = Array.from(container.querySelectorAll('.triage-checkbox:checked'));
+                const checked = Array.from(container.querySelectorAll('.review-checkbox:checked'));
                 const approved = checked.map(cb => {
                     const issue = JSON.parse(cb.dataset.issue);
-                    const assigneeSelect = cb.closest('.triage-item')?.querySelector('.qa-assignee-select');
+                    const assigneeSelect = cb.closest('.review-item')?.querySelector('.qa-assignee-select');
                     issue.assignee = assigneeSelect?.dataset.email || '';
                     return issue;
                 });
@@ -417,7 +417,7 @@ LibreCrawlPlugin.register({
                     body: JSON.stringify({ approval: approved })
                 });
 
-                container.querySelector('#agent-triage').style.display = 'none';
+                container.querySelector('#agent-review').style.display = 'none';
                 container.querySelector('#agent-running').style.display = 'block';
                 container.querySelector('#agent-running p').textContent =
                     `Creating tickets for ${approved.length} issue(s). Please wait...`;
@@ -468,7 +468,7 @@ LibreCrawlPlugin.register({
                         // trim to only the fields the route uses — avoids sending full explanation blobs
                         body: JSON.stringify({
                             message: msg,
-                            issues: _triageIssues.map(i => ({ url: i.url, issue: i.issue, priority: i.priority, type: i.type }))
+                            issues: _reviewIssues.map(i => ({ url: i.url, issue: i.issue, priority: i.priority, type: i.type }))
                         })
                     });
                     const result = await resp.json();
@@ -476,7 +476,7 @@ LibreCrawlPlugin.register({
 
                     if (result.success) {
                         this.appendChatMessage(container, result.reply, 'agent');
-                        this.filterChecklistByContent(container, result.matches, _triageIssues.length);
+                        this.filterChecklistByContent(container, result.matches, _reviewIssues.length);
                     } else {
                         this.appendChatMessage(container, `Couldn't process that: ${result.error || 'unknown error'}`, 'agent');
                     }
@@ -757,12 +757,12 @@ LibreCrawlPlugin.register({
             <!--Agent 2 (explain, during the first running wait) and Agent 3 (fix, during
                 the second) run one after another, never at once, so they share one live
                 token log here rather than each getting a separate panel. Sits outside the
-                idle/running/triage/done toggle divs above so it doesn't vanish when the
+                idle/running/review/done toggle divs above so it doesn't vanish when the
                 phase changes — only what's inside it updates.-->
             ${this.renderTokenLogBlock(['agent2', 'agent3'], '🪙 Agent 2 & 3 — Token Usage')}
 
-            <!--state: triage ready-->
-            <div id="agent-triage" style="display:none;">
+            <!--state: review ready-->
+            <div id="agent-review" style="display:none;">
                 <h4 style="margin-bottom:12px;">Review Issues for Ticket Creation</h4>
                 <div style="display:flex; gap:16px; min-height:450px;">
 
@@ -1018,10 +1018,10 @@ LibreCrawlPlugin.register({
                         const i = idx++;
                         const color = issue.priority === 'high' ? '#ef4444' : issue.priority === 'medium' ? '#f59e0b' : '#3b82f6';
                         return `
-                            <div class="triage-item" data-index="${i}" style="display:flex; align-items:center; margin-bottom:8px; gap:8px;">
+                            <div class="review-item" data-index="${i}" style="display:flex; align-items:center; margin-bottom:8px; gap:8px;">
                                 <span style="width:10px; height:10px; border-radius:50%; background-color:${color};
                             flex-shrink:0; display:inline-block;"></span>
-                                <input type="checkbox" class="triage-checkbox"
+                                <input type="checkbox" class="review-checkbox"
                             data-issue='${JSON.stringify(issue).replace(/'/g, "&#39;")}' style="transform:scale(1.2);">
                                 <span class="ticket-exists-tick" style="display:none; flex-shrink:0;"></span>
                                 <input type="text" class="qa-assignee-select" autocomplete="off" data-index="${i}" placeholder="Assignee…" style="background: #0f172a; color: #e5e7eb; border: 1px solid #374151; padding: 4px 6px; border-radius: 4px; font-size: 11px; flex-shrink:0; width: 110px;">
@@ -1056,7 +1056,7 @@ LibreCrawlPlugin.register({
             .then(r => r.json())
             .then(result => {
                 if (!result.success) return;
-                checklist.querySelectorAll('.triage-checkbox').forEach(cb => {
+                checklist.querySelectorAll('.review-checkbox').forEach(cb => {
                     const issueData = JSON.parse(cb.dataset.issue);
                     const key = cacheKeyFor(issueData.url, issueData.issue);
                     const ticket = result.tickets[key];
@@ -1064,7 +1064,7 @@ LibreCrawlPlugin.register({
 
                     cb.checked  = false;
                     cb.disabled = true;
-                    const tick = cb.closest('.triage-item')?.querySelector('.ticket-exists-tick');
+                    const tick = cb.closest('.review-item')?.querySelector('.ticket-exists-tick');
                     if (tick) {
                         tick.style.display = 'inline';
                         tick.innerHTML = `<a href="${ticket.ticket_url}" target="_blank" title="Ticket already exists — #${ticket.ticket_id}" style="text-decoration:none; font-size:13px;">✅</a>`;
@@ -1121,8 +1121,8 @@ LibreCrawlPlugin.register({
             (matches || []).map(m => `${m.issue}|||${m.url}`)
         );
         let visible = 0;
-        container.querySelectorAll('.triage-item').forEach(el => {
-            const cb = el.querySelector('.triage-checkbox');
+        container.querySelectorAll('.review-item').forEach(el => {
+            const cb = el.querySelector('.review-checkbox');
             if (!cb) return;
             const data = JSON.parse(cb.dataset.issue);
             const key  = `${data.issue}|||${data.url}`;

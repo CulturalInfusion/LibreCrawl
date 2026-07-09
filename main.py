@@ -18,7 +18,7 @@ from flask_compress import Compress
 from functools import wraps
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
-from src.agents.ticket_review_agent import run_agentic as run_triage_agent
+from src.agents.ticket_review_agent import run_agentic as run_review_agent
 from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL, ANTHROPIC_EXPLAIN_MODEL, OPENAI_EXPLAIN_MODEL, record_usage, get_usage_summary, get_usage_log
 from src.agents.prompts import (
     build_explain_issue_prompt, EXPLAIN_ISSUE_SYSTEM_PROMPT,
@@ -1858,7 +1858,7 @@ _qa_bulk_state = {'running': False, 'results': None}
 @app.route("/api/agent/start_workflow", methods=['POST'])
 def start_workflow():
     if not AGENT2_ENABLED:
-        return jsonify({'success': False, 'error': 'Agent 2 (triage) is disabled — set AGENT2_ENABLED=true to enable.'}), 503
+        return jsonify({'success': False, 'error': 'Agent 2 (review) is disabled — set AGENT2_ENABLED=true to enable.'}), 503
     global _agent_state
     data = request.get_json()
     _agent_state["url"]     = data.get("url")
@@ -1869,7 +1869,7 @@ def start_workflow():
     _agent_state["results"] = None
 
     issues = _agent_state["issues"]
-    thread = threading.Thread(target=run_triage_agent, args=(issues,), daemon=True)
+    thread = threading.Thread(target=run_review_agent, args=(issues,), daemon=True)
     thread.start()
 
     return jsonify({'success': True})
@@ -1884,20 +1884,20 @@ def workflow_trigger():
 
     return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature"), 'issues': _agent_state.get("issues", [])})
 
-@app.route("/api/agent/triage", methods=['POST'])
-def agent_triage():
+@app.route("/api/agent/review", methods=['POST'])
+def agent_review():
     global _agent_state
     data = request.get_json()
-    _agent_state["triage"] = data.get("issues", [])
-    _agent_state["status"] = "Triage ready"
+    _agent_state["review"] = data.get("issues", [])
+    _agent_state["status"] = "Review ready"
     return jsonify({'success': True})
 
-@app.route("/api/agent/triage", methods=['GET'])
-def get_triage():
+@app.route("/api/agent/review", methods=['GET'])
+def get_review():
     global _agent_state
-    if _agent_state.get("status") != "Triage ready":
-        return jsonify({'success': False, 'error': 'Triage not ready'}), 400
-    return jsonify({'success': True, 'issues': _agent_state.get("triage", [])})
+    if _agent_state.get("status") != "Review ready":
+        return jsonify({'success': False, 'error': 'Review not ready'}), 400
+    return jsonify({'success': True, 'issues': _agent_state.get("review", [])})
 
 @app.route("/api/agent/approval", methods=['POST'])
 def agent_approval():
