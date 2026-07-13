@@ -1,12 +1,12 @@
 """
-Tool schemas for the triage agent.
+Tool schemas for the review agent.
 
 Design principle: no tool requires parameters. All data flow is handled
 by Python's dispatch layer, not by the LLM passing data between calls.
 The LLM's only job is to call tools in the right sequence.
 """
 
-TRIAGE_TOOLS = [
+REVIEW_TOOLS = [
     {
         "name": "select_issues",
         "description": (
@@ -22,7 +22,7 @@ TRIAGE_TOOLS = [
         }
     },
     {
-        "name": "post_triage_results",
+        "name": "post_review_results",
         "description": (
             "Sends the explained issue list to the browser so the human can review "
             "and select which ones to ticket. Call this after select_issues — "

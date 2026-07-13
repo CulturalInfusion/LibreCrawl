@@ -18,8 +18,12 @@ from flask_compress import Compress
 from functools import wraps
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
-from src.agents.triage_agent import run_agentic as run_triage_agent
-from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL
+from src.agents.ticket_review_agent import run_agentic as run_review_agent
+from src.agents.provider import get_provider, set_provider_override, ANTHROPIC_MODEL, OPENAI_MODEL, ANTHROPIC_EXPLAIN_MODEL, OPENAI_EXPLAIN_MODEL, record_usage, get_usage_summary, get_usage_log
+from src.agents.prompts import (
+    build_explain_issue_prompt, EXPLAIN_ISSUE_SYSTEM_PROMPT,
+    build_agent_chat_prompt, AGENT_CHAT_SYSTEM_PROMPT,
+)
 from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, create_magic_link, verify_magic_link
 from src.email_service import send_verification_email, send_welcome_email, send_magic_link_email
 
@@ -74,8 +78,11 @@ DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'ye
 SKIP_AUTH = args.dangerously_skip_auth or os.getenv('DANGEROUSLY_SKIP_AUTH', '').lower() in ('true', '1', 'yes')
 ALLOWED_EMAIL_DOMAIN = os.getenv('ALLOWED_EMAIL_DOMAIN', '')
 MAIN_APP_URL = os.getenv('MAIN_APP_URL', 'http://localhost:5000').rstrip('/')
-ANTHROPIC_EXPLAIN_MODEL = os.getenv('ANTHROPIC_EXPLAIN_MODEL', 'claude-haiku-4-5-20251001')
-OPENAI_EXPLAIN_MODEL = os.getenv('OPENAI_EXPLAIN_MODEL', 'gpt-3.5-turbo')
+
+AGENT2_ENABLED = os.getenv('AGENT2_ENABLED', 'true').lower() != 'false'
+AGENT3_ENABLED = os.getenv('AGENT3_ENABLED', 'true').lower() != 'false'
+AGENT4_ENABLED = os.getenv('AGENT4_ENABLED', 'true').lower() != 'false'
+AZURE_QA_TAG   = os.getenv('AZURE_QA_TAG', 'qa')
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
@@ -256,25 +263,32 @@ instances_lock = threading.Lock()
 
 def get_or_create_crawler():
     """Get or create a crawler instance for the current session"""
-    # Get or create session ID
     if 'session_id' not in session:
         session['session_id'] = str(uuid.uuid4())
 
     session_id = session['session_id']
-    user_id = session.get('user_id')  # Get user_id from session
-    tier = session.get('tier', 'guest')  # Get tier from session
+    user_id = session.get('user_id')
+    tier = session.get('tier', 'guest')
 
     with instances_lock:
-        # Check if crawler exists for this session
         if session_id not in crawler_instances:
+            # Before creating a blank instance, adopt any crawl that is still running.
+            # This handles the case where the app restarted and the session cookie was
+            # invalidated, leaving a live crawl thread orphaned under a different session_id.
+            for existing_id, instance in crawler_instances.items():
+                if instance['crawler'].is_running:
+                    session['session_id'] = existing_id
+                    instance['last_accessed'] = datetime.now()
+                    print(f"Session {session_id} adopted running crawl from session {existing_id}")
+                    return instance['crawler']
+
             print(f"Creating new crawler instance for session: {session_id}, user: {user_id}, tier: {tier}")
             crawler_instances[session_id] = {
                 'crawler': WebCrawler(),
-                'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),  # Per-user settings
+                'settings': SettingsManager(session_id=session_id, user_id=user_id, tier=tier),
                 'last_accessed': datetime.now()
             }
         else:
-            # Update last accessed time
             crawler_instances[session_id]['last_accessed'] = datetime.now()
 
         return crawler_instances[session_id]['crawler']
@@ -1564,6 +1578,9 @@ def explain_issue():
         category = data.get('category', '')
         details = data.get('details', '')
         page_context = data.get('page_context', {})
+        # Defaults to agent2 (this route's usual caller); qa_agent.py passes
+        # 'agent4' so its calls don't get misattributed to Agent 2's token log.
+        caller_agent = data.get('agent', 'agent2')
 
         # Build context string from page data
         context_parts = []
@@ -1578,41 +1595,23 @@ def explain_issue():
 
         context_str = '\n'.join(context_parts) if context_parts else 'No additional context available'
 
-        # Build the prompt for OpenAI
-        prompt = f"""You are an SEO expert providing actionable advice. Analyze this specific issue:
+        # Prompt built in src/agents/prompts.py — see build_explain_issue_prompt()
+        prompt = build_explain_issue_prompt(url, issue, category, details, context_str)
 
-URL: {url}
-Issue: {issue}
-Category: {category}
-Details: {details}
-
-Page Context:
-{context_str}
-
-Provide a JSON response with exactly this structure:
-{{
-    "explanation": "2-3 sentence explanation of why this issue matters for SEO and user experience",
-    "how_to_fix": "Step-by-step fix instructions (3-5 bullet points, use markdown formatting with • for bullets)",
-    "priority": "high/medium/low based on SEO impact",
-    "role": "Most suitable role from this list only: Webmaster (SEO config, robots.txt, sitemaps, schema markup, indexability), Copywriter / Content Editor (written content, meta descriptions, social tags, OG metadata), Web Developer (code, performance, accessibility implementation, responsive design, ARIA), Designer (visual design, color contrast, typography, layout, UX)"
-}}
-
-Keep the explanation concise but specific to this URL. Use SEMRush-style actionable language."""
-
-        # Call OpenAI API
+        # Call Anthropic API
         if provider == 'anthropic':
             response = anthropic_client.messages.create(
                 model=ANTHROPIC_EXPLAIN_MODEL,
-                system='You are an SEO expert. Always respond with valid JSON.',
+                system=EXPLAIN_ISSUE_SYSTEM_PROMPT,
                 messages=[{'role': 'user', 'content': prompt}],
                 max_tokens=500,
             )
         else:
-        # Call Anthropic API
+        # Call OpenAI API
             response = openai_client.chat.completions.create(
             model=OPENAI_EXPLAIN_MODEL,
             messages=[
-                {'role': 'system', 'content': 'You are an SEO expert, specialized in WordPress websites. The URLs you crawl are Wordpress sites so all fix guidance must  reference WordPress-specific tooling: wp-admin, plugins, themes. Do not give generic CMS advice. Always respond with valid JSON.'},
+                {'role': 'system', 'content': EXPLAIN_ISSUE_SYSTEM_PROMPT},
                 {'role': 'user', 'content': prompt}
             ],
             max_tokens=500,
@@ -1628,10 +1627,13 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             ai_response = json.loads(text[text.find('{'):text.rfind('}')+1])
 
         # Log token usage
+        explain_model = ANTHROPIC_EXPLAIN_MODEL if provider == 'anthropic' else OPENAI_EXPLAIN_MODEL
         if provider == 'anthropic':
-            tokens = response.usage.input_tokens + response.usage.output_tokens
+            input_tokens, output_tokens = response.usage.input_tokens, response.usage.output_tokens
         else:
-            tokens = response.usage.total_tokens
+            input_tokens, output_tokens = response.usage.prompt_tokens, response.usage.completion_tokens
+        tokens = input_tokens + output_tokens
+        record_usage(caller_agent, explain_model, input_tokens, output_tokens, label=issue)
         print(f"AI Explain - Tokens used: {tokens}")
 
         how_to_fix = ai_response.get('how_to_fix', '')
@@ -1645,7 +1647,7 @@ Keep the explanation concise but specific to this URL. Use SEMRush-style actiona
             'priority': ai_response.get('priority', 'medium'),
             'role': ai_response.get('role', ''),
             'tokens_used': tokens,
-            'model': ANTHROPIC_EXPLAIN_MODEL if provider == 'anthropic' else OPENAI_EXPLAIN_MODEL
+            'model': explain_model
         })
 
     except Exception as e:
@@ -1851,9 +1853,12 @@ def devops_features():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 _agent_state = {}
+_qa_bulk_state = {'running': False, 'results': None}
 
 @app.route("/api/agent/start_workflow", methods=['POST'])
 def start_workflow():
+    if not AGENT2_ENABLED:
+        return jsonify({'success': False, 'error': 'Agent 2 (review) is disabled — set AGENT2_ENABLED=true to enable.'}), 503
     global _agent_state
     data = request.get_json()
     _agent_state["url"]     = data.get("url")
@@ -1864,7 +1869,7 @@ def start_workflow():
     _agent_state["results"] = None
 
     issues = _agent_state["issues"]
-    thread = threading.Thread(target=run_triage_agent, args=(issues,), daemon=True)
+    thread = threading.Thread(target=run_review_agent, args=(issues,), daemon=True)
     thread.start()
 
     return jsonify({'success': True})
@@ -1879,20 +1884,20 @@ def workflow_trigger():
 
     return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature"), 'issues': _agent_state.get("issues", [])})
 
-@app.route("/api/agent/triage", methods=['POST'])
-def agent_triage():
+@app.route("/api/agent/review", methods=['POST'])
+def agent_review():
     global _agent_state
     data = request.get_json()
-    _agent_state["triage"] = data.get("issues", [])
-    _agent_state["status"] = "Triage ready"
+    _agent_state["review"] = data.get("issues", [])
+    _agent_state["status"] = "Review ready"
     return jsonify({'success': True})
 
-@app.route("/api/agent/triage", methods=['GET'])
-def get_triage():
+@app.route("/api/agent/review", methods=['GET'])
+def get_review():
     global _agent_state
-    if _agent_state.get("status") != "Triage ready":
-        return jsonify({'success': False, 'error': 'Triage not ready'}), 400
-    return jsonify({'success': True, 'issues': _agent_state.get("triage", [])})
+    if _agent_state.get("status") != "Review ready":
+        return jsonify({'success': False, 'error': 'Review not ready'}), 400
+    return jsonify({'success': True, 'issues': _agent_state.get("review", [])})
 
 @app.route("/api/agent/approval", methods=['POST'])
 def agent_approval():
@@ -1958,25 +1963,29 @@ def create_bulk_tickets():
             user_id=session.get('user_id')
         )
         if success:
-            try:
-                from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
-                fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
-                result['agent3_status'] = fix_result.get('status')
-                result['agent3_reason'] = fix_result.get('reason', '')
-                result['agent3_object_id'] = fix_result.get('object_id')
-                result['agent3_object_type'] = fix_result.get('object_type')
+            if not AGENT3_ENABLED:
+                result['agent3_status'] = 'disabled'
+                result['agent3_reason'] = 'Agent 3 is disabled — set AGENT3_ENABLED=true to enable auto-fix.'
+            else:
+                try:
+                    from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
+                    fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
+                    result['agent3_status'] = fix_result.get('status')
+                    result['agent3_reason'] = fix_result.get('reason', '')
+                    result['agent3_object_id'] = fix_result.get('object_id')
+                    result['agent3_object_type'] = fix_result.get('object_type')
 
-                if fix_result['status'] == 'fixed':
-                    qa_state = os.getenv('AZURE_QA_STATE', 'QA')
-                    result['agent3_qa_state'] = qa_state
-                    result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
-                    if fix_result.get('caveat'):
-                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
-                elif fix_result['status'] == 'deferred':
-                    result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
-            except Exception as e:
-                result['agent3_status'] = 'error'
-                result['agent3_reason'] = f'Agent 3 failed: {e}'
+                    if fix_result['status'] == 'fixed':
+                        qa_state = os.getenv('AZURE_QA_STATE', 'QA')
+                        result['agent3_qa_state'] = qa_state
+                        result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
+                        if fix_result.get('caveat'):
+                            result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
+                    elif fix_result['status'] in ('skipped', 'error') and fix_result.get('reason'):
+                        result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
+                except Exception as e:
+                    result['agent3_status'] = 'error'
+                    result['agent3_reason'] = f'Agent 3 failed: {e}'
 
             created.append(result)
         else:
@@ -1992,74 +2001,6 @@ def get_results():
     if _agent_state.get("status") != "Completed":
         return jsonify({'ready': False})
     return jsonify({'ready': True, 'results': _agent_state.get("results", {})})
-
-@app.route("/api/agent/chat", methods=['POST'])
-def agent_chat():
-    provider = 'anthropic' if anthropic_client else 'openai' if openai_client else None
-    if provider is None:
-        return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
-
-    data    = request.get_json()
-    message = data.get('message', '')
-    issues  = data.get('issues', [])
-
-    issue_lines = '\n'.join(
-        f"{iss.get('issue','')} | {iss.get('url','')} | priority:{iss.get('priority','?')} | type:{iss.get('type','')}"
-        for iss in issues
-    )
-
-    prompt = f"""You are helping a developer triage SEO audit issues before creating tickets.
-
-Issue list (issue | url | priority | type):
-{issue_lines}
-
-User request: {message}
-
-First, write 1-2 sentences summarising what you found and listing the matched issue names.
-Then output a JSON block with the exact issue name and url for each match:
-{{"matches": [{{"issue": "exact issue name", "url": "exact url"}}]}}
-
-If all issues should be shown, include them all. Copy issue names and URLs exactly as written above. Always include the JSON block."""
-
-    try:
-        if provider == 'anthropic':
-            resp = anthropic_client.messages.create(
-                model=ANTHROPIC_EXPLAIN_MODEL,
-                system='You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.',
-                messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=1500,
-            )
-            text = resp.content[0].text
-        else:
-            resp = openai_client.chat.completions.create(
-                model=OPENAI_EXPLAIN_MODEL,
-                messages=[
-                    {'role': 'system', 'content': 'You are an SEO triage assistant. Copy issue names and URLs exactly as given. Always end your reply with a JSON block.'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                max_tokens=1500,
-            )
-            text = resp.choices[0].message.content
-
-        json_match = re.search(r'\{\s*"matches"\s*:', text)
-        if json_match:
-            json_start = json_match.start()
-            json_end   = text.rfind('}') + 1
-            match_data = json.loads(text[json_start:json_end])
-            reply      = text[:json_start].strip()
-        else:
-            match_data = {'matches': []}
-            reply      = text.strip()
-
-        return jsonify({
-            'success': True,
-            'reply': reply,
-            'matches': match_data.get('matches', [])
-        })
-
-    except Exception as e:
-        print(f"[Chat] Error: {e}")
-        return jsonify({'success': False, 'error': 'Chat request failed'}), 500
 
 @app.route('/api/devops/identities', methods=['GET'])
 @login_required
@@ -2110,6 +2051,174 @@ def devops_identities():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route("/api/agent/qa_check_ticket", methods=['POST'])
+@login_required
+def agent_qa_check_ticket():
+    """Agent 4, read-only: look up one Azure ticket by ID, validate it's in
+    AZURE_QA_STATE, recheck its url, return findings for a human to act on.
+    Writes nothing — see qa_mark_done/qa_post_comment below."""
+    if not AGENT4_ENABLED:
+        return jsonify({'success': False, 'error': 'Agent 4 (QA) is disabled — set AGENT4_ENABLED=true to enable.'}), 503
+    data = request.get_json()
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    ticket_id = data.get('ticket_id')
+    if not project:
+        return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    if not ticket_id:
+        return jsonify({'success': False, 'error': 'No ticket ID provided.'}), 400
+    from src.agents.qa_agent import check_ticket
+    try:
+        result = check_ticket(project, ticket_id)
+        return jsonify({'success': True, 'result': result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route("/api/agent/qa_mark_done", methods=['POST'])
+@login_required
+def agent_qa_mark_done():
+    """Human clicked 'Mark Done' for a ticket Agent 4 confirmed as resolved."""
+    data = request.get_json()
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    ticket_id = data.get('ticket_id')
+    if not project or not ticket_id:
+        return jsonify({'success': False, 'error': 'project and ticket_id are required.'}), 400
+    from src.agents.qa_agent import mark_ticket_done
+    try:
+        ok = mark_ticket_done(project, ticket_id)
+        return jsonify({'success': ok})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route("/api/agent/qa_post_comment", methods=['POST'])
+@login_required
+def agent_qa_post_comment():
+    """Human clicked 'Post Comment' for a ticket still failing Agent 4's recheck."""
+    data = request.get_json()
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    ticket_id = data.get('ticket_id')
+    comment = data.get('comment', '').strip()
+    if not project or not ticket_id or not comment:
+        return jsonify({'success': False, 'error': 'project, ticket_id, and comment are required.'}), 400
+    from src.agents.qa_agent import post_qa_comment
+    try:
+        ok = post_qa_comment(project, ticket_id, comment)
+        return jsonify({'success': ok})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _run_qa_bulk(ticket_ids, project):
+    global _qa_bulk_state
+    from src.agents.qa_agent import check_ticket, mark_ticket_done, post_qa_comment
+    collected = []
+    try:
+        for tid in ticket_ids:
+            try:
+                result = check_ticket(project, int(tid))
+                ticket_url = result.get('ticket_url', '')
+                title = result.get('title', '')
+                if result.get('error'):
+                    collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'skipped', 'reason': result['error']})
+                elif not result.get('still_present'):
+                    mark_ticket_done(project, int(tid))
+                    collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'done'})
+                else:
+                    fix = result.get('ai_how_to_fix')
+                    comment = f"Still detected: '{result.get('issue')}'. Suggested fix:\n{fix}" if fix else f"Still detected: '{result.get('issue')}' on {result.get('url')}."
+                    post_qa_comment(project, int(tid), comment)
+                    collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'still_present'})
+            except Exception as e:
+                collected.append({'ticket_id': tid, 'ticket_url': '', 'title': '', 'status': 'skipped', 'reason': str(e)})
+    finally:
+        _qa_bulk_state = {'running': False, 'results': collected}
+
+
+@app.route("/api/agent/qa_tickets_by_tag", methods=['GET'])
+@login_required
+def qa_tickets_by_tag():
+    """Fetch all Azure tickets tagged 'qa' for the bulk QA run checklist."""
+    import base64
+    from urllib.parse import quote as url_quote
+    project = request.args.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    if not project:
+        return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    org = os.getenv('AZURE_DEVOPS_ORG')
+    if not org:
+        return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG not configured.'}), 500
+    pat = os.getenv('AZURE_DEVOPS_PAT')
+    try:
+        token = base64.b64encode(f':{pat}'.encode()).decode()
+        headers = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}
+        wiql_url = f'https://dev.azure.com/{org}/{url_quote(project)}/_apis/wit/wiql?api-version=7.1'
+        resp = requests.post(wiql_url, headers=headers, json={"query": f"SELECT [System.Id] FROM WorkItems WHERE [System.Tags] CONTAINS '{AZURE_QA_TAG}' ORDER BY [System.Id] DESC"}, timeout=10)
+        resp.raise_for_status()
+        work_items = resp.json().get('workItems', [])
+        if not work_items:
+            return jsonify({'success': True, 'tickets': []})
+        ids = ','.join(str(w['id']) for w in work_items)
+        fields = 'System.Id,System.Title,System.State,System.Tags'
+        batch_url = f'https://dev.azure.com/{org}/{url_quote(project)}/_apis/wit/workitems?ids={ids}&fields={fields}&api-version=7.1'
+        resp2 = requests.get(batch_url, headers=headers, timeout=10)
+        resp2.raise_for_status()
+        tickets = []
+        for item in resp2.json().get('value', []):
+            f = item.get('fields', {})
+            tid = item['id']
+            tickets.append({
+                'ticket_id': tid,
+                'title': f.get('System.Title', ''),
+                'state': f.get('System.State', ''),
+                'tags': f.get('System.Tags', ''),
+                'ticket_url': f'https://dev.azure.com/{org}/{url_quote(project)}/_workitems/edit/{tid}'
+            })
+        return jsonify({'success': True, 'tickets': tickets})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route("/api/agent/qa_bulk_run", methods=['POST'])
+@login_required
+def qa_bulk_run():
+    """Start a background bulk QA check on the given ticket IDs (tagged with AZURE_QA_TAG).
+    Auto-marks resolved tickets Done; posts a comment on still-present ones."""
+    if not AGENT4_ENABLED:
+        return jsonify({'success': False, 'error': 'Agent 4 (QA) is disabled — set AGENT4_ENABLED=true to enable.'}), 503
+    global _qa_bulk_state
+    if _qa_bulk_state.get('running'):
+        return jsonify({'success': False, 'error': 'QA bulk run already in progress.'}), 409
+    data = request.get_json()
+    ticket_ids = data.get('ticket_ids', [])
+    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
+    if not ticket_ids:
+        return jsonify({'success': False, 'error': 'No ticket IDs provided.'}), 400
+    if not project:
+        return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    _qa_bulk_state = {'running': True, 'results': None}
+    threading.Thread(target=_run_qa_bulk, args=(ticket_ids, project), daemon=True).start()
+    return jsonify({'queued': True})
+
+
+@app.route("/api/agent/qa_bulk_results", methods=['GET'])
+@login_required
+def qa_bulk_results():
+    return jsonify({'ready': not _qa_bulk_state.get('running', False), 'results': _qa_bulk_state.get('results')})
+
+
+@app.route("/api/agent/token_usage", methods=['GET'])
+@login_required
+def agent_token_usage():
+    """Token usage for one panel's worth of agents: aggregate totals (per agent/model)
+    plus the scrollable per-call log, newest first. ?agent=agent2,agent3 scopes both
+    (comma-separated for a panel shared by more than one agent); omit for everything."""
+    agent_param = request.args.get('agent')
+    agent = agent_param.split(',') if agent_param else None
+    return jsonify({
+        'success': True,
+        'summary': get_usage_summary(agent),
+        'log': get_usage_log(agent),
+    })
+
+
 @app.route("/api/agent/provider_options", methods=['GET'])
 def provider_options():
     return jsonify({
@@ -2130,6 +2239,68 @@ def set_provider():
         return jsonify({'success': False, 'error': 'OpenAI API key not configured'}), 400
     set_provider_override(provider)
     return jsonify({'success': True, 'provider': provider})
+
+@app.route("/api/agent/chat", methods=['POST'])
+def agent_chat():
+    provider = get_provider()
+    if provider is None:
+        return jsonify({'success': False, 'error': 'No AI provider configured'}), 400
+
+    data    = request.get_json()
+    message = data.get('message', '')
+    issues  = data.get('issues', [])
+
+    issue_lines = '\n'.join(
+        f"{iss.get('issue','')} | {iss.get('url','')} | priority:{iss.get('priority','?')} | type:{iss.get('type','')}"
+        for iss in issues
+    )
+
+    # Prompt built in src/agents/prompts.py — see build_agent_chat_prompt()
+    prompt = build_agent_chat_prompt(issue_lines, message)
+
+    try:
+        if provider == 'anthropic':
+            resp = anthropic_client.messages.create(
+                model=ANTHROPIC_MODEL,
+                system=AGENT_CHAT_SYSTEM_PROMPT,
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=4096,
+            )
+            text = resp.content[0].text
+            input_tokens, output_tokens = resp.usage.input_tokens, resp.usage.output_tokens
+        else:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {'role': 'system', 'content': AGENT_CHAT_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': prompt}
+                ],
+                max_tokens=4096,
+            )
+            text = resp.choices[0].message.content
+            input_tokens, output_tokens = resp.usage.prompt_tokens, resp.usage.completion_tokens
+
+        record_usage('agent2', ANTHROPIC_MODEL if provider == 'anthropic' else OPENAI_MODEL, input_tokens, output_tokens, label='agent_chat')
+
+        json_match = re.search(r'\{\s*"matches"\s*:', text)
+        if json_match:
+            json_start = json_match.start()
+            json_end   = text.rfind('}') + 1
+            match_data = json.loads(text[json_start:json_end])
+            reply      = text[:json_start].strip()
+        else:
+            match_data = {'matches': []}
+            reply      = text.strip()
+
+        return jsonify({
+            'success': True,
+            'reply': reply,
+            'matches': match_data.get('matches', [])
+        })
+
+    except Exception as e:
+        print(f"[Chat] Error: {e}")
+        return jsonify({'success': False, 'error': 'Chat request failed'}), 500
 
 def main():
     import signal

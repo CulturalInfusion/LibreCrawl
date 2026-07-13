@@ -1,16 +1,25 @@
+"""
+Agent 2 — Ticket Review.
+Triggered by: Agent 1 completing a crawl and posting issues to the workflow queue.
+Input: list of crawl issues. Output: Azure DevOps tickets for human-approved issues.
+Flow: explain issues (parallel AI calls) → post to browser for review → poll for
+human approval → create tickets for approved items.
+Does NOT apply any fixes — that is Agent 3's job.
+"""
 import time
 import json
 from src.mcp_server import (
     poll_workflow_trigger,
     poll_crawl_status,
     explain_issue,
-    post_triage_results,
+    post_review_results,
     poll_approval,
     create_bulk_tickets,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.agents.provider import call_with_tools, get_provider
-from src.agents.tools    import TRIAGE_TOOLS
+from src.agents.tools    import REVIEW_TOOLS
+from src.agents.prompts  import REVIEW_AGENT_SYSTEM_PROMPT
 
 POLL_INTERVAL = 3  # seconds between polling calls
 
@@ -24,8 +33,8 @@ def execute_tool(name, inputs):
             inputs['category'],
             inputs['details']
         )
-    if name == 'post_triage_results':
-        return post_triage_results(inputs['issues'])
+    if name == 'post_review_results':
+        return post_review_results(inputs['issues'])
     if name == 'poll_approval':
         return poll_approval()
     if name == 'create_bulk_tickets':
@@ -37,22 +46,44 @@ def explain(issue):
     explanation = explain_issue(issue['url'], issue['issue'], issue['category'], issue['details'])
     return {**issue, **explanation}
 
-def triage_issues(issues):
-    """Call explain_issue for every non-info issue, sort by severity, return ranked list.
+def review_issues(issues):
+    """Call explain_issue once per unique (issue, category) pair, then apply to all matching issues.
     Returns list of dicts: {url, issue, category, type, priority, explanation, how_to_fix, role}
-    Reference: main.py POST /api/explain_issue (line 1528) for response shape
-    WordPress constraint: explain_issue prompt already handles this server-side.
     Sort order: errors first, then warnings. Within each group, 'high' priority before 'medium'/'low'.
     """
-    ranked = []
+    filtered = [i for i in issues if i['type'] != 'info']
+    if not filtered:
+        return []
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(explain, issue) for issue in issues if issue['type'] != 'info']
+    # Collect one representative per unique (issue, category) — explanation is type-level, not URL-specific.
+    unique_pairs = {}
+    for i in filtered:
+        key = (i['issue'], i['category'])
+        if key not in unique_pairs:
+            unique_pairs[key] = i
+
+    explanations = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {
+            executor.submit(
+                explain_issue,
+                rep['url'], rep['issue'], rep['category'], rep['details']
+            ): key
+            for key, rep in unique_pairs.items()
+        }
         for future in as_completed(futures):
-            ranked.append(future.result())
-    
+            key = futures[future]
+            try:
+                explanations[key] = future.result()
+            except Exception as e:
+                print(f"explain_issue error for {key}: {e}")
+                explanations[key] = {}
+
+    ranked = [{**issue, **explanations.get((issue['issue'], issue['category']), {})}
+              for issue in filtered]
+
     priority_order = {'high': 0, 'medium': 1, 'low': 2}
-    ranked = sorted(ranked, key=lambda issue: priority_order.get(issue.get('priority', 'low'), 2))
+    ranked = sorted(ranked, key=lambda i: priority_order.get(i.get('priority', 'low'), 2))
     return ranked
 
 
@@ -80,9 +111,9 @@ def create_tickets(approved):
 
 def run(issues):
     """Main agent loop. Runs once per workflow trigger."""
-    ranked = triage_issues(issues)
-    print(f"[Agent] Triage complete. Posting digest ({len(ranked)} issues).")
-    post_triage_results(ranked)
+    ranked = review_issues(issues)
+    print(f"[Agent] Review complete. Posting digest ({len(ranked)} issues).")
+    post_review_results(ranked)
 
     print("[Agent] Waiting for human approval...")
     approved = wait_for_approval()
@@ -100,36 +131,25 @@ def run_agentic(issues):
     Falls back to run() if no AI provider is configured.
     """
     if not issues:
-        print("[Agent] No issues to triage.")
+        print("[Agent] No issues to review.")
         return
 
     if not get_provider():
         print("[Agent] No AI provider configured — falling back to pipeline run().")
         return run(issues)
 
-    system = (
-        "You are an SEO triage agent for a WordPress website. "
-        "Call these four tools in order — none require parameters:\n"
-        "1. select_issues — explains the crawl issues and prepares them for review\n"
-        "2. post_triage_results — sends the list to the browser for human approval\n"
-        "3. poll_approval — a human is reviewing the issues in their browser and may take "
-        "several minutes. Call this tool again every time it returns success=false, with "
-        "no limit on how many attempts that takes. Never decide on your own that the human "
-        "isn't responding, never give up, and never stop to report a problem at this step — "
-        "the only valid way to leave step 3 is a poll_approval result with success=true.\n"
-        "4. create_bulk_tickets — creates the approved tickets in Azure DevOps\n"
-        "Do not pass any parameters to any tool. Just call them in sequence."
-    )
+    # System prompt built in src/agents/prompts.py — see REVIEW_AGENT_SYSTEM_PROMPT
+    system = REVIEW_AGENT_SYSTEM_PROMPT
 
     messages = [{
         "role": "user",
-        "content": f"There are {len(issues)} SEO issues ready for triage. Start the workflow."
+        "content": f"There are {len(issues)} SEO issues ready for review. Start the workflow."
     }]
 
     print(f"[Agent] Starting agentic loop ({len(issues)} issues, provider: {get_provider()}).")
 
     provider       = get_provider()
-    explained      = []   # filled by select_issues, consumed by post_triage_results
+    explained      = []   # filled by select_issues, consumed by post_review_results
     approval_cache = []   # filled by poll_approval, consumed by create_bulk_tickets
 
     def dispatch(name, _inputs):
@@ -156,14 +176,14 @@ def run_agentic(issues):
                 print(f"[Agent] Could not check existing tickets ({e}) — processing all issues.")
 
             print(f"[Agent] Explaining {len(new_issues)} issues in parallel...")
-            result = triage_issues(new_issues)
+            result = review_issues(new_issues)
             explained[:] = result
             print(f"[Agent] {len(result)} issues explained.")
             return {'status': 'ready', 'count': len(result), 'skipped_existing': skipped}
 
-        if name == 'post_triage_results':
+        if name == 'post_review_results':
             print(f"[Agent] Posting {len(explained)} issues for review.")
-            return post_triage_results(explained)
+            return post_review_results(explained)
 
         if name == 'poll_approval':
             result = poll_approval()
@@ -180,7 +200,7 @@ def run_agentic(issues):
         return {'error': f'Unknown tool: {name}'}
 
     while True:
-        stop, text, tool_calls, raw_content = call_with_tools(messages, TRIAGE_TOOLS, system)
+        stop, text, tool_calls, raw_content = call_with_tools(messages, REVIEW_TOOLS, system)
 
         if text:
             print(f"[Agent] {text}")

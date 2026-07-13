@@ -538,7 +538,7 @@ function updateProgressText(data) {
             progressText.textContent = `Finishing up... (${stats.crawled} URLs crawled)`;
         }
     } else {
-        progressText.textContent = 'Initializing...';
+        progressText.textContent = 'Ready';
     }
 }
 

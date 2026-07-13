@@ -11,7 +11,7 @@ import asyncio
 import re
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.robotparser import RobotFileParser
 import nest_asyncio
 
@@ -72,6 +72,22 @@ from src.core.sitemap_parser import SitemapParser
 from src.core.issue_detector import IssueDetector
 from src.core.memory_monitor import MemoryMonitor
 from src.core.memory_profiler import UserMemoryTracker
+
+
+def check_single_url(url):
+    """Re-fetch and re-analyze exactly one URL, outside the full crawl lifecycle.
+    Used by Agent 4 (QA agent) to verify whether a previously-flagged issue still
+    exists. Synchronous, no threads, no DB writes — a bare WebCrawler with just
+    enough components wired up for a single-page fetch + issue detection pass.
+    Returns (result_dict, issues_list).
+    """
+    crawler = WebCrawler()
+    crawler.base_domain = urlparse(url).netloc
+    crawler.link_manager = LinkManager(crawler.base_domain)
+    crawler.issue_detector = IssueDetector(crawler.config.get('issue_exclusion_patterns', []))
+    result = crawler._crawl_url_with_requests(url, depth=0)
+    crawler.issue_detector.detect_issues(result)
+    return result, crawler.issue_detector.get_issues()
 
 
 class WebCrawler:
@@ -838,11 +854,13 @@ class WebCrawler:
                 self.is_running_pagespeed = False
 
             # Update all linked_from fields before completing
+            print(f"Updating linked-from fields for {len(self.crawl_results)} URLs...")
             self._update_all_linked_from()
+            print("Linked-from update complete.")
 
             # Run duplication detection on all crawled content
             if self.issue_detector and self.config.get('enable_duplication_check', True):
-                print("Running duplication detection...")
+                print(f"Running duplication detection on {len(self.crawl_results)} pages...")
                 duplication_threshold = self.config.get('duplication_threshold', 0.85)
                 self.issue_detector.detect_duplication_issues(self.crawl_results, duplication_threshold)
                 print(f"Duplication detection complete. Total issues: {len(self.issue_detector.get_issues())}")
@@ -1397,7 +1415,7 @@ class WebCrawler:
             return True
 
     def _run_pagespeed_analysis(self):
-        """Run PageSpeed analysis on selected pages"""
+        """Run PageSpeed analysis on selected pages (pages analyzed in parallel)."""
         try:
             selected_pages = self._select_pages_for_pagespeed()
 
@@ -1405,35 +1423,39 @@ class WebCrawler:
                 print("No suitable pages found for PageSpeed analysis")
                 return
 
-            print(f"Running PageSpeed analysis on {len(selected_pages)} pages...")
+            print(f"Running PageSpeed analysis on {len(selected_pages)} pages (parallel)...")
 
             pagespeed_results = []
-            for i, page_url in enumerate(selected_pages):
+            results_lock = threading.Lock()
+
+            def analyze_page(page_url):
                 if not self.is_running:
-                    print("PageSpeed analysis cancelled")
-                    return
-
-                print(f"Analyzing page {i+1}/{len(selected_pages)}: {page_url}")
-
-                # Mobile analysis
+                    return None
                 mobile_result = self._call_pagespeed_api(page_url, 'mobile')
-                time.sleep(2)
-
                 if not self.is_running:
-                    return
-
-                # Desktop analysis
+                    return None
+                time.sleep(2)
                 desktop_result = self._call_pagespeed_api(page_url, 'desktop')
-
-                pagespeed_results.append({
+                return {
                     'url': page_url,
                     'mobile': mobile_result,
                     'desktop': desktop_result,
                     'analysis_date': time.strftime('%Y-%m-%d %H:%M:%S')
-                })
+                }
 
-                if i < len(selected_pages) - 1:
-                    time.sleep(3)
+            with ThreadPoolExecutor(max_workers=len(selected_pages)) as executor:
+                futures = {executor.submit(analyze_page, url): url for url in selected_pages}
+                for future in as_completed(futures):
+                    if not self.is_running:
+                        break
+                    try:
+                        result = future.result()
+                        if result:
+                            with results_lock:
+                                pagespeed_results.append(result)
+                            print(f"PageSpeed complete: {result['url']}")
+                    except Exception as e:
+                        print(f"PageSpeed error for {futures[future]}: {e}")
 
             self.stats['pagespeed_results'] = pagespeed_results
             print(f"PageSpeed analysis completed for {len(pagespeed_results)} pages")

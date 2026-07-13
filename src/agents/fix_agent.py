@@ -1,5 +1,14 @@
+"""
+Agent 3 — Fix.
+Triggered by: supervisor clicking "Run Agent 3" on an Azure DevOps ticket.
+Input: Azure ticket ID. Output: SEO fix applied to the WordPress site via WP REST API,
+ticket state updated, or deferral comment posted if the fix can't be automated.
+Requires: RankMath plugin active on the target site for most FIX_MAP entries.
+Does NOT verify that the fix worked — that is Agent 4's job.
+"""
 import os
 import base64
+import textwrap
 import requests
 from urllib.parse import quote, urlparse, urljoin
 from bs4 import BeautifulSoup
@@ -9,6 +18,7 @@ from src.agents.wordpress import (
     probe_site, ensure_plugin_active, create_redirect_rule, NAMESPACE_PLUGIN_MAP,
 )
 from src.agents.provider import call_with_tools
+from src.agents.prompts import build_plugin_decision_prompt, build_fix_title_prompt
 
 
 def _confirm_rendered(url, expected):
@@ -21,18 +31,46 @@ def _confirm_rendered(url, expected):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
-        return {'Could not fetch page'}
+        return {'__fetch_error__': str(e)}
 
     missing = {}
     for name, value in expected.items():
         if name == '__title__':
+            # startswith, not ==: the theme appends its own " | Site Name" suffix
+            # to every rendered <title>, which Agent 3 never writes and can't remove.
             rendered = soup.title.string.strip() if soup.title and soup.title.string else None
+            ok = rendered is not None and rendered.startswith(value)
         else:
             tag = soup.find('meta', attrs={'name': name}) or soup.find('meta', attrs={'property': name})
             rendered = tag.get('content', '') if tag else None
-        if rendered != value:
+            ok = rendered == value
+        if not ok:
             missing[name] = f'expected {value!r}, found {rendered!r}'
     return missing
+
+
+def _confirm_canonical_rendered(url, expected_href):
+    """Re-fetch url and check whether <link rel="canonical"> matches expected_href.
+    Returns None if it matches, or a reason string if it's missing/mismatched.
+    Confirmed live on ci-dev.xyz: RankMath can persist a canonical value (visible in
+    its own Advanced tab) without ever outputting the <link> tag on the page — that's
+    a RankMath output/config issue, not a write failure, so the reason says so instead
+    of just 'not found'."""
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+    except Exception as e:
+        return f'could not re-fetch page to verify: {e}'
+
+    tag = soup.find('link', rel='canonical')
+    rendered = tag.get('href') if tag else None
+    if rendered == expected_href:
+        return None
+    if rendered is None:
+        return ('canonical value was written but no <link rel="canonical"> tag is rendered on the '
+                 'page — looks like a RankMath output/configuration issue, not a write failure')
+    return f'canonical value was written but rendered as {rendered!r}, expected {expected_href!r}'
 
 
 def _fetch_page_context(url):
@@ -59,12 +97,8 @@ def decide_required_plugin(issue, active_namespaces):
     rather than triggering an install.
     """
     candidates = {ns: slug for ns, slug in NAMESPACE_PLUGIN_MAP.items() if ns in ('rankmath/v1', 'redirection/v1')}
-    prompt = (
-        f"Issue: '{issue}'. Site's currently active plugin REST namespaces: {active_namespaces}.\n"
-        f"Which plugin slug is needed to fix this issue? Valid answers, exactly as written, "
-        f"nothing else: {list(candidates.values())} or 'none'."
-    )
-    _, text, _, _ = call_with_tools([{'role': 'user', 'content': prompt}], [])
+    prompt = build_plugin_decision_prompt(issue, active_namespaces, list(candidates.values()))
+    _, text, _, _ = call_with_tools([{'role': 'user', 'content': prompt}], [], agent="agent3", label=f"Plugin check — {issue}")
     answer = text.strip().strip("'\"")
     return answer if answer in candidates.values() else 'none'
 
@@ -107,17 +141,31 @@ def _redirect_confidence_check(url):
 
 def fix_title_core(ticket):
     """LLM-generated title, sized to the ticket's specific complaint. Written via
-    core REST's native `title` field — no RankMath/plugin dependency."""
+    core REST's native `title` field — no RankMath/plugin dependency.
+
+    The rendered <title> tag always has the theme's own " | Site Name" suffix
+    appended after whatever we write here (confirmed live on ci-dev.xyz — the
+    theme does this for every page, Agent 3 never touches it). The 60-char
+    target is for the *rendered* title, so the budget for our own text has to
+    leave room for that suffix, not aim for 60 raw characters. Suffix is read
+    from the page's current title rather than hardcoded, so this still works
+    on pages/themes with a different or no suffix.
+
+    If the AI still overshoots its budget, shorten() cuts at a word boundary
+    instead of a blind character slice — a mid-word cut previously produced
+    grammatically broken titles (e.g. "Cultural Infusion" -> "Cultural Infus").
+    """
     ctx = _fetch_page_context(ticket['url'])
-    length = "between 30 and 60 characters" if 'Short' in ticket['issue'] else "at most 60 characters"
-    prompt = (
-        f"Write a single SEO page title, {length}, for this webpage.\n"
-        f"Current title (may be missing or the wrong length): {ctx['title']}\n"
-        f"Main heading: {ctx['h1']}\nPage content excerpt: {ctx['body_excerpt']}\n"
-        f"Return only the title text, no quotes, no preamble."
-    )
-    _, text, _, _ = call_with_tools([{'role': 'user', 'content': prompt}], [])
-    return text.strip()[:60]
+    current_title = ctx['title']
+    suffix = current_title[current_title.rindex(' | '):] if ' | ' in current_title else ''
+    budget = max(60 - len(suffix), 20)
+    length = f"between 30 and {budget} characters" if 'Short' in ticket['issue'] else f"at most {budget} characters"
+    prompt = build_fix_title_prompt(length, current_title, ctx['h1'], ctx['body_excerpt'])
+    _, text, _, _ = call_with_tools([{'role': 'user', 'content': prompt}], [], agent="agent3", label=ticket['issue'])
+    title = text.strip()
+    if len(title) > budget:
+        title = textwrap.shorten(title, width=budget, placeholder='', break_on_hyphens=False)
+    return title
 
 
 def fix_meta_description(ticket):
@@ -249,6 +297,18 @@ def run_fix(ticket):
             print(f"[Agent 3] Write succeeded but title did not render: {missing}")
             return {'status': 'error', 'reason': f'write succeeded but did not render: {missing}', 'issue': issue, 'url': url}
 
+        rendered_title = _fetch_page_context(url)['title']
+        if len(rendered_title) > 60:
+            print(f"[Agent 3] Title rendered but total length ({len(rendered_title)}) still exceeds 60 chars: {rendered_title!r}")
+            return {
+                'status': 'error',
+                'reason': (f'title write succeeded and rendered, but total rendered length is '
+                           f'{len(rendered_title)} chars (still over 60) — likely an SEO plugin/theme '
+                           f'title-template interaction: {rendered_title!r}'),
+                'issue': issue,
+                'url': url,
+            }
+
         print(f"[Agent 3] Fix applied and confirmed rendered. New title: {new_title}")
         return {
             'status': 'fixed',
@@ -266,7 +326,7 @@ def run_fix(ticket):
         if not final_url:
             reason = _defer_reason(issue)
             print(f"[Agent 3] Redirect chain isn't a safe single-hop same-domain collapse — deferring. {reason}")
-            return {'status': 'deferred', 'reason': reason, 'issue': issue, 'url': url}
+            return {'status': 'skipped', 'reason': reason, 'issue': issue, 'url': url}
 
         print(f"[Agent 3] Safe to collapse: {url} -> {final_url}")
         namespaces = probe_site(url)['namespaces']
@@ -280,7 +340,7 @@ def run_fix(ticket):
                 caveat = f"Installed and activated '{plugin_slug}' on this site to apply this fix — please confirm it's appropriate."
             except Exception as e:
                 print(f"[Agent 3] Could not auto-install '{plugin_slug}': {e}")
-                return {'status': 'deferred', 'reason': f"Redirection plugin not found and auto-install failed ({e}).", 'issue': issue, 'url': url}
+                return {'status': 'skipped', 'reason': f"Redirection plugin not found and auto-install failed ({e}).", 'issue': issue, 'url': url}
 
         try:
             create_redirect_rule(url, urlparse(url).path, final_url)
@@ -296,7 +356,7 @@ def run_fix(ticket):
         reason = _defer_reason(issue)
         if reason:
             print(f"[Agent 3] '{issue}' is not fixable by Agent 3 — deferring to human. {reason}")
-            return {'status': 'deferred', 'reason': reason, 'issue': issue, 'url': url}
+            return {'status': 'skipped', 'reason': reason, 'issue': issue, 'url': url}
         print(f"[Agent 3] '{issue}' is not in the fix map — skipping.")
         return {'status': 'skipped', 'reason': 'not in fix map', 'issue': issue, 'url': url}
 
@@ -326,7 +386,7 @@ def run_fix(ticket):
             caveat = f"Installed and activated '{plugin_slug}' on this site to apply this fix — please confirm it's appropriate."
         except Exception as e:
             print(f"[Agent 3] Could not auto-install '{plugin_slug}': {e}")
-            return {'status': 'deferred', 'reason': f"RankMath not found and auto-install failed ({e}).", 'issue': issue, 'url': url}
+            return {'status': 'skipped', 'reason': f"RankMath not found and auto-install failed ({e}).", 'issue': issue, 'url': url}
 
     meta_dict = fix_fn(ticket)
     print(f"[Agent 3] Applying fix: updating {list(meta_dict.keys())} on {object_type} {object_id}...")
@@ -343,6 +403,19 @@ def run_fix(ticket):
             'object_id': object_id,
             'object_type': object_type,
         }
+
+    if 'rank_math_canonical_url' in meta_dict:
+        canonical_issue = _confirm_canonical_rendered(url, meta_dict['rank_math_canonical_url'])
+        if canonical_issue:
+            print(f"[Agent 3] Write succeeded but canonical did not render correctly: {canonical_issue}")
+            return {
+                'status': 'error',
+                'reason': canonical_issue,
+                'issue': issue,
+                'url': url,
+                'object_id': object_id,
+                'object_type': object_type,
+            }
 
     print(f"[Agent 3] Fix applied. Updated: {meta_dict}")
     return {
@@ -376,10 +449,10 @@ def add_ticket_comment(ticket_id, project, comment):
     try:
         resp = requests.post(api_url, headers=headers, json=body, timeout=10)
         resp.raise_for_status()
-        print(f"[Agent 3] Comment added to ticket {ticket_id}.")
+        print(f"[Ticket] Comment added to ticket {ticket_id}.")
         return True
     except Exception:
-        print(f"[Agent 3] Could not add comment to ticket {ticket_id} — request to Azure DevOps failed.")
+        print(f"[Ticket] Could not add comment to ticket {ticket_id} — request to Azure DevOps failed.")
         return False
 
 
@@ -402,8 +475,8 @@ def set_ticket_state(ticket_id, project, state):
     try:
         resp = requests.patch(api_url, headers=headers, json=body, timeout=10)
         resp.raise_for_status()
-        print(f"[Agent 3] Ticket {ticket_id} moved to '{state}'.")
+        print(f"[Ticket] Ticket {ticket_id} moved to '{state}'.")
         return True
     except Exception:
-        print(f"[Agent 3] Could not update ticket {ticket_id} state — request to Azure DevOps failed.")
+        print(f"[Ticket] Could not update ticket {ticket_id} state — request to Azure DevOps failed.")
         return False
