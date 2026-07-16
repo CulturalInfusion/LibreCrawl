@@ -82,7 +82,8 @@ MAIN_APP_URL = os.getenv('MAIN_APP_URL', 'http://localhost:5000').rstrip('/')
 AGENT2_ENABLED = os.getenv('AGENT2_ENABLED', 'true').lower() != 'false'
 AGENT3_ENABLED = os.getenv('AGENT3_ENABLED', 'true').lower() != 'false'
 AGENT4_ENABLED = os.getenv('AGENT4_ENABLED', 'true').lower() != 'false'
-AZURE_QA_TAG   = os.getenv('AZURE_QA_TAG', 'qa')
+AZURE_QA_TAG   = os.getenv('AZURE_QA_TAG', 'qa-agent')
+AZURE_FIX_TAG  = os.getenv('AZURE_FIX_TAG', 'fix-agent')
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
@@ -1968,7 +1969,7 @@ def create_bulk_tickets():
                 result['agent3_reason'] = 'Agent 3 is disabled — set AGENT3_ENABLED=true to enable auto-fix.'
             else:
                 try:
-                    from src.agents.fix_agent import run_fix, set_ticket_state, add_ticket_comment
+                    from src.agents.fix_agent import run_fix, set_ticket_state, set_ticket_tag, add_ticket_comment
                     fix_result = run_fix({'url': url, 'issue': issue_name, 'details': issue.get('details', '')})
                     result['agent3_status'] = fix_result.get('status')
                     result['agent3_reason'] = fix_result.get('reason', '')
@@ -1979,6 +1980,11 @@ def create_bulk_tickets():
                         qa_state = os.getenv('AZURE_QA_STATE', 'QA')
                         result['agent3_qa_state'] = qa_state
                         result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
+                        result['agent3_tag_added'] = set_ticket_tag(result['ticket_id'], project, AZURE_FIX_TAG)
+                        # Agent 4's QA Bulk Run finds tickets by AZURE_QA_TAG, not by state —
+                        # without this, a ticket Agent 3 fixes and moves to 'QA' state never
+                        # surfaces in that checklist for Agent 4 to pick up automatically.
+                        result['agent3_qa_tag_added'] = set_ticket_tag(result['ticket_id'], project, AZURE_QA_TAG)
                         if fix_result.get('caveat'):
                             result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
                     elif fix_result['status'] in ('skipped', 'error') and fix_result.get('reason'):

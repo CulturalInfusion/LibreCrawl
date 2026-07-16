@@ -155,3 +155,82 @@ def build_fix_title_prompt(length, current_title, h1, body_excerpt):
         f"Main heading: {h1}\nPage content excerpt: {body_excerpt}\n"
         f"Return only the title text, no quotes, no preamble, no partial words."
     )
+
+
+# ---------------------------------------------------------------------------
+# fix_meta_description() / fix_og_tags() / fix_twitter_tags() — src/agents/fix_agent.py
+#
+# Used by: fix_agent.py's fix_meta_description(), fix_og_tags(), fix_twitter_tags() —
+# same prompt, different length budget, since a meta description/OG description/Twitter
+# description are the same kind of text with different ideal lengths.
+#
+# Pattern: mirrors build_fix_title_prompt exactly (grounds the model in the page's
+# actual title/h1/body content instead of letting it invent something ungrounded) —
+# replaces what used to be a hardcoded "[Agent 3] Description for: <url>" placeholder
+# written with no LLM call at all.
+# ---------------------------------------------------------------------------
+
+def build_fix_meta_description_prompt(length, title, h1, body_excerpt):
+    return (
+        f"Write a single SEO meta description, {length}, for this webpage.\n"
+        f"Page title: {title}\nMain heading: {h1}\nPage content excerpt: {body_excerpt}\n"
+        f"Return only the description text, no quotes, no preamble, no partial words."
+    )
+
+
+# ---------------------------------------------------------------------------
+# fix_missing_h1() — src/agents/fix_agent.py
+#
+# Used by: fix_agent.py's fix_missing_h1() only, sent as a bare user message
+# with no system prompt (same pattern as build_plugin_decision_prompt /
+# build_fix_title_prompt).
+#
+# Pattern: interpolates the post's raw block content + page title. The model
+# must return text EXACTLY as it appears in that raw content (or the literal
+# string 'NONE') — fix_missing_h1() does an exact-match search for that text
+# afterward and refuses to write anything unless it matches precisely once,
+# so "verbatim, nothing paraphrased" is load-bearing for that safety check.
+# ---------------------------------------------------------------------------
+
+def build_fix_h1_prompt(raw_content, page_title):
+    return (
+        f"This WordPress page (title: \"{page_title}\") is missing a proper <h1> heading. "
+        f"Below is its raw block content. Does any existing block's text read like it was "
+        f"meant to be this page's main heading (e.g. the post title rendered as a lower-level "
+        f"heading, or a short standalone line at the top functioning as one)?\n\n"
+        f"Raw content:\n{raw_content}\n\n"
+        f"If yes, return that block's text EXACTLY as it appears above — verbatim, no "
+        f"paraphrasing, no added or removed punctuation, since it needs to match precisely "
+        f"against the content afterward. If no clear candidate exists, return exactly: NONE"
+    )
+
+
+# ---------------------------------------------------------------------------
+# fix_images_alt_text() — src/agents/fix_agent.py
+#
+# Used by: fix_agent.py's fix_images_alt_text() only, sent through
+# call_with_vision() alongside the actual image bytes — this is the text half
+# of a multimodal message, not a bare user message like the other fix_agent
+# prompts in this file.
+#
+# Pattern: asks the model to classify decorative vs. descriptive before
+# describing anything, since icons/spacers/dividers are correctly served with
+# empty alt text (alt=""), not a generated caption — a vision call that always
+# describes every image would produce confidently wrong alt text for those.
+# The literal string 'DECORATIVE' is load-bearing: fix_images_alt_text() checks
+# for that exact token (case-insensitive) to decide whether to write an empty
+# string instead of the model's text, so it can't be rephrased without updating
+# that check too.
+# ---------------------------------------------------------------------------
+
+
+def build_fix_alt_text_prompt(page_title):
+    return (
+        f"This image appears on a webpage titled \"{page_title}\".\n"
+        f"First decide: is this image purely decorative (an icon, spacer, divider, or "
+        f"background flourish with no informational content), or does it convey real "
+        f"content a screen-reader user would need described?\n"
+        f"If decorative, respond with exactly: DECORATIVE\n"
+        f"Otherwise, write a concise, descriptive alt text (under 125 characters) describing "
+        f"what the image shows, in plain language. Return only that text — no quotes, no preamble."
+    )
