@@ -233,6 +233,91 @@ def apply_fix(url, post_id, object_type, field, new_value):
     return resp.json()[field]
 
 
+_WP_RESIZE_SUFFIX = re.compile(r'-\d+x\d+(?=\.\w+$)')
+
+
+def _strip_wp_resize_suffix(filename):
+    """Strip WordPress's auto-generated '-{width}x{height}' suffix from a filename
+    (e.g. 'photo-1024x512.png' -> 'photo.png'). <img src> on a page almost always
+    points to one of these generated variants, while the media library's own
+    title/slug (what /wp/v2/media's search param matches against) is based on the
+    original filename — searching on the un-stripped resized filename can return
+    zero candidates even when the attachment genuinely exists."""
+    return _WP_RESIZE_SUFFIX.sub('', filename)
+
+
+def resolve_media_id(url, image_url):
+    """Find the WordPress media library attachment ID for an image URL.
+
+    <img src> on a page almost always references an auto-generated resized variant
+    (e.g. photo-1024x512.png), not the original upload that WordPress registers as
+    the attachment's own source_url (photo.png) — so this searches on the base
+    filename (resize suffix stripped) and confirms the match by checking BOTH the
+    attachment's source_url and every one of its registered media_details.sizes
+    entries for an exact filename match against the real image_url.
+
+    /wp/v2/media's search param matches title/caption/alt text too, not just the
+    filename — trusting the first result risks writing alt text to the wrong
+    attachment on a site with a large media library, so this still requires an
+    exact filename match; it's just checked against every size WordPress
+    generated instead of only the original upload. Returns None if no exact match
+    is found (caller should defer rather than guess).
+    """
+    base_url = _base_url(map_to_target_url(url))
+    filename = os.path.basename(urlparse(image_url).path)
+    if not filename:
+        return None
+    search_term = _strip_wp_resize_suffix(filename)
+
+    try:
+        results = _rest_get(base_url, '/wp/v2/media', search=search_term, per_page=20)
+    except Exception:
+        return None
+
+    for item in results:
+        candidate_urls = [item.get('source_url', '')]
+        sizes = item.get('media_details', {}).get('sizes', {})
+        candidate_urls += [size.get('source_url', '') for size in sizes.values()]
+        if any(os.path.basename(urlparse(u).path) == filename for u in candidate_urls if u):
+            return item['id']
+    return None
+
+
+def apply_alt_text(url, media_id, alt_text):
+    """Update a media attachment's alt_text field via the core REST API.
+    Requires WP_USERNAME and WP_APP_PASSWORD in the environment (Application Password auth).
+    Kept separate from apply_fix (which targets /posts and /pages) since media is a
+    different endpoint with different field semantics — not just a different collection name.
+    """
+    parsed = urlparse(map_to_target_url(url))
+    api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/wp/v2/media/{media_id}"
+
+    resp = requests.post(
+        api_url,
+        auth=_wp_auth(),
+        json={'alt_text': alt_text},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()['alt_text']
+
+
+def get_raw_content(url, post_id, object_type):
+    """Fetch a post/page's raw (unrendered) content — includes Gutenberg block
+    comments/markup intact, unlike the public GET which only returns rendered HTML.
+    Needed so a fix can locate and replace one specific block by exact text match
+    rather than working blind against rendered output. Requires WP_USERNAME and
+    WP_APP_PASSWORD (the edit context requires authentication).
+    """
+    parsed = urlparse(map_to_target_url(url))
+    collection = 'pages' if object_type == 'page' else 'posts'
+    api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/wp/v2/{collection}/{post_id}"
+
+    resp = requests.get(api_url, auth=_wp_auth(), params={'context': 'edit'}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()['content']['raw']
+
+
 def get_plugin_status(base_url, slug):
     """Return 'active', 'inactive', or None (not installed) for a plugin slug.
     Requires an Administrator-level Application Password — Editor-level 403s on
