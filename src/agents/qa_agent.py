@@ -53,7 +53,7 @@ def _parse_ticket_url(description):
 def fetch_ticket(org, project, ticket_id):
     """GET a single work item by ID with just the fields the QA check needs."""
     headers = _auth_headers()
-    fields = 'System.Title,System.Description,System.State,Microsoft.VSTS.Common.AcceptanceCriteria'
+    fields = 'System.Title,System.Description,System.State,System.Tags,Microsoft.VSTS.Common.AcceptanceCriteria'
     url = f'https://dev.azure.com/{org}/{quote(project)}/_apis/wit/workitems/{ticket_id}?fields={fields}&api-version=7.1'
     resp = requests.get(url, headers=headers, timeout=10)
     resp.raise_for_status()
@@ -79,16 +79,22 @@ def _draft_fix_suggestion(url, issue, category):
 
 
 def check_ticket(project, ticket_id):
-    """Agent 4, read-only: fetch one ticket, validate it's in AZURE_QA_STATE, recover
-    its url/issue from Title/Description, re-crawl the url, and return findings for a
-    human to act on. Drafts an AI-suggested fix if the issue is still present. Writes
-    nothing to Azure — see mark_ticket_done()/post_qa_comment() for that.
+    """Agent 4, read-only: fetch one ticket, validate it's in AZURE_QA_STATE AND carries
+    the AZURE_QA_TAG tag, recover its url/issue from Title/Description, re-crawl the url,
+    and return findings for a human to act on. Drafts an AI-suggested fix if the issue is
+    still present. Writes nothing to Azure — see mark_ticket_done()/post_qa_comment() for
+    that.
+    Both the state and tag are required, not either/or — a ticket that only has one (e.g.
+    a human manually moved it to 'QA' without the tag, or the tag survived a state change
+    away from 'QA') isn't reliably a ticket Agent 3 actually fixed and queued for QA, so
+    it's rejected just the same as one that's outright missing both.
     Returns a dict; always has ticket_id/ticket_url; 'error' is set (others may be
     missing) when the ticket can't be checked further — state_ok tells you whether
-    it at least cleared the QA-state gate.
+    it at least cleared the state+tag gate.
     """
     org = os.getenv('AZURE_DEVOPS_ORG')
     qa_state = os.getenv('AZURE_QA_STATE', 'QA')
+    qa_tag = os.getenv('AZURE_QA_TAG', 'qa-agent')
     ticket_url = f'https://dev.azure.com/{org}/{quote(project)}/_workitems/edit/{ticket_id}'
 
     try:
@@ -99,6 +105,7 @@ def check_ticket(project, ticket_id):
 
     fields = item.get('fields', {})
     state = fields.get('System.State', '')
+    tags = [t.strip() for t in fields.get('System.Tags', '').split(';') if t.strip()]
     title = fields.get('System.Title', '')
     description = fields.get('System.Description', '')
     acceptance_criteria = fields.get('Microsoft.VSTS.Common.AcceptanceCriteria', '')
@@ -106,9 +113,14 @@ def check_ticket(project, ticket_id):
     base = {'ticket_id': ticket_id, 'ticket_url': ticket_url, 'title': title, 'state': state,
             'acceptance_criteria': acceptance_criteria}
 
-    if state != qa_state:
+    if state != qa_state or qa_tag not in tags:
+        problems = []
+        if state != qa_state:
+            problems.append(f"state is '{state}', not '{qa_state}'")
+        if qa_tag not in tags:
+            problems.append(f"missing the '{qa_tag}' tag")
         return {**base, 'state_ok': False,
-                'error': f"Ticket #{ticket_id} is in state '{state}', not '{qa_state}' — nothing to check."}
+                'error': f"Ticket #{ticket_id} isn't ready for QA — {' and '.join(problems)}."}
 
     parsed_title = _parse_ticket_title(title)
     url = _parse_ticket_url(description)
