@@ -209,28 +209,44 @@ def build_fix_h1_prompt(raw_content, page_title):
 # fix_images_alt_text() — src/agents/fix_agent.py
 #
 # Used by: fix_agent.py's fix_images_alt_text() only, sent through
-# call_with_vision() alongside the actual image bytes — this is the text half
-# of a multimodal message, not a bare user message like the other fix_agent
-# prompts in this file.
+# call_with_tools() as a bare text user message — no image bytes travel with
+# this call. The model reasons from filename/figcaption/heading/surrounding-
+# paragraph context extracted by _fetch_images_without_alt() instead of seeing
+# the image pixels, to cut per-image token cost versus a vision call.
 #
 # Pattern: asks the model to classify decorative vs. descriptive before
 # describing anything, since icons/spacers/dividers are correctly served with
-# empty alt text (alt=""), not a generated caption — a vision call that always
-# describes every image would produce confidently wrong alt text for those.
-# The literal string 'DECORATIVE' is load-bearing: fix_images_alt_text() checks
-# for that exact token (case-insensitive) to decide whether to write an empty
-# string instead of the model's text, so it can't be rephrased without updating
-# that check too.
+# empty alt text (alt=""), not a generated caption. The literal string
+# 'DECORATIVE' is load-bearing: fix_images_alt_text() checks for that exact
+# token (case-insensitive) to decide whether to write an empty string instead
+# of the model's text, so it can't be rephrased without updating that check
+# too. This contract is unchanged from the earlier vision-based version.
 # ---------------------------------------------------------------------------
 
 
-def build_fix_alt_text_prompt(page_title):
+def build_fix_alt_text_prompt(page_title, image):
+    context_lines = [f'Image filename: {image["filename"]}']
+    if image.get('title_attr'):
+        context_lines.append(f'Image title attribute: "{image["title_attr"]}"')
+    if image.get('figcaption'):
+        context_lines.append(f'Figure caption: "{image["figcaption"]}"')
+    if image.get('nearby_heading'):
+        context_lines.append(f'Nearest heading above the image: "{image["nearby_heading"]}"')
+    if image.get('surrounding_text'):
+        context_lines.append(f'Surrounding paragraph text: "{image["surrounding_text"]}"')
+    context_str = '\n'.join(context_lines)
+
     return (
-        f"This image appears on a webpage titled \"{page_title}\".\n"
-        f"First decide: is this image purely decorative (an icon, spacer, divider, or "
-        f"background flourish with no informational content), or does it convey real "
-        f"content a screen-reader user would need described?\n"
+        f"An image appears on a webpage titled \"{page_title}\", but you cannot see the image "
+        f"itself — only this text context extracted from around it on the page:\n\n"
+        f"{context_str}\n\n"
+        f"First decide: going only on this context, is this image LIKELY purely decorative (an "
+        f"icon, spacer, divider, or background flourish with no informational content — e.g. a "
+        f"generic filename like \"icon-1.png\" or \"divider.svg\" with no caption, heading, or "
+        f"surrounding text describing it), or does it more likely convey real content a "
+        f"screen-reader user would need described?\n"
         f"If decorative, respond with exactly: DECORATIVE\n"
-        f"Otherwise, write a concise, descriptive alt text (under 125 characters) describing "
-        f"what the image shows, in plain language. Return only that text — no quotes, no preamble."
+        f"Otherwise, infer a concise, descriptive alt text (under 125 characters) for what the "
+        f"image most likely shows, grounded only in the context above — do not invent specific "
+        f"visual details you have no basis for. Return only that text — no quotes, no preamble."
     )

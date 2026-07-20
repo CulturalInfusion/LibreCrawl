@@ -20,14 +20,15 @@ from src.agents.wordpress import (
     probe_site, ensure_plugin_active, create_redirect_rule, NAMESPACE_PLUGIN_MAP,
     resolve_media_id, apply_alt_text, get_raw_content, map_to_target_url,
 )
-from src.agents.provider import call_with_tools, call_with_vision
+from src.agents.provider import call_with_tools
+from src.agents.url_safety import assert_safe_url
 from src.agents.prompts import (
     build_plugin_decision_prompt, build_fix_title_prompt,
     build_fix_alt_text_prompt, build_fix_h1_prompt, build_fix_meta_description_prompt,
 )
 
 # Images processed per 'Images Without Alt Text' ticket — bounds cost/latency, since each
-# image is a vision call plus a WordPress write.
+# image is one AI text call plus a WordPress write.
 MAX_ALT_TEXT_IMAGES = 5
 
 # Some sites (confirmed live on ci-dev.xyz) have hotlink protection that rejects a direct
@@ -48,6 +49,7 @@ def _confirm_rendered(url, expected):
     empty dict means everything rendered. The '__title__' key checks the <title>
     element instead of a <meta> tag."""
     try:
+        assert_safe_url(url)
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -78,6 +80,7 @@ def _confirm_canonical_rendered(url, expected_href):
     a RankMath output/config issue, not a write failure, so the reason says so instead
     of just 'not found'."""
     try:
+        assert_safe_url(url)
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -101,6 +104,7 @@ def _fetch_current_meta_description(url):
     endpoint — confirmed live, only updateMeta/updateMetaBulk exist). Returns None if there's
     no current description tag at all, which is the accurate 'before' for a Missing ticket."""
     try:
+        assert_safe_url(url)
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -118,6 +122,7 @@ def _confirm_meta_description_rendered(url, expected_description):
     (canonical) while OpenGraph/Social tags render fine on the same page — description hasn't
     been assumed safe from the same failure, so this checks it explicitly instead."""
     try:
+        assert_safe_url(url)
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -138,6 +143,7 @@ def _confirm_h1_rendered(url):
     """Re-fetch url and check whether an <h1> now exists anywhere on the rendered page.
     Returns None if it does, or a reason string if the write didn't produce one."""
     try:
+        assert_safe_url(url)
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -165,6 +171,7 @@ def _wp_admin_check_link(site_url, object_type, object_id):
 def _fetch_page_context(url):
     """Re-fetch a page and pull title/H1/opening body text for LLM prompts."""
     try:
+        assert_safe_url(url)
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -179,12 +186,16 @@ def _fetch_page_context(url):
 
 
 def _fetch_images_without_alt(url):
-    """Re-fetch the live page and find <img> tags with no alt attribute at all.
-    The ticket's details field is only a count string ("3 of 10 images lack alt
-    text") — no per-image URLs travel with it — so they have to be re-derived
-    here, same re-fetch-at-fix-time pattern as _fetch_page_context.
+    """Re-fetch the live page and find <img> tags with no alt attribute at all, along with
+    surrounding DOM/text context (figcaption, nearest heading, nearby paragraph text, title
+    attribute) so alt text can be generated from that context instead of a vision call on the
+    image pixels — see fix_images_alt_text(). The ticket's details field is only a count
+    string ("3 of 10 images lack alt text") — no per-image URLs travel with it — so both the
+    image list and its context have to be re-derived here, same re-fetch-at-fix-time pattern
+    as _fetch_page_context.
     """
     try:
+        assert_safe_url(url)
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -202,7 +213,22 @@ def _fetch_images_without_alt(url):
         src = img.get('src')
         if not src:
             continue
-        images.append(urljoin(url, src))
+        abs_src = urljoin(url, src)
+
+        figure = img.find_parent('figure')
+        figcaption = figure.find('figcaption') if figure else None
+        heading = img.find_previous(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+        prev_p = img.find_previous('p')
+        next_p = img.find_next('p')
+
+        images.append({
+            'src': abs_src,
+            'filename': os.path.basename(urlparse(abs_src).path),
+            'title_attr': (img.get('title') or '').strip(),
+            'figcaption': figcaption.get_text(' ', strip=True) if figcaption else '',
+            'nearby_heading': heading.get_text(' ', strip=True) if heading else '',
+            'surrounding_text': ' '.join(t.get_text(' ', strip=True) for t in (prev_p, next_p) if t).strip(),
+        })
     return images
 
 
@@ -229,6 +255,7 @@ def _trace_redirect_chain(url, max_hops=10):
     """
     chain, current = [], url
     for _ in range(max_hops):
+        assert_safe_url(current)
         resp = requests.get(current, allow_redirects=False, timeout=10)
         chain.append((current, resp.status_code))
         if resp.status_code in (301, 302, 303, 307, 308) and 'Location' in resp.headers:
@@ -304,9 +331,12 @@ def fix_title_core(ticket):
 
 
 def fix_images_alt_text(ticket):
-    """Fix for 'Images Without Alt Text' — vision-generated alt text written directly to
-    each affected image's WordPress media attachment. Capped at MAX_ALT_TEXT_IMAGES per
-    ticket (each image costs one vision call plus one WP write). Returns a full run_fix-style
+    """Fix for 'Images Without Alt Text' — alt text generated from page/DOM context around
+    each image (filename, figcaption, nearest heading, surrounding paragraph text) via a
+    text-only LLM call, not a vision call on the image pixels — cuts token cost per image.
+    Written directly to each affected image's WordPress media attachment. Capped at
+    MAX_ALT_TEXT_IMAGES per ticket (each image costs one AI text call plus one WP write).
+    Returns a full run_fix-style
     result dict covering all images processed, rather than the single RankMath meta dict
     other FIX_MAP entries return — alt text isn't a RankMath field, so this is dispatched as
     its own special-cased branch in run_fix, not through apply_rankmath_meta.
@@ -324,12 +354,21 @@ def fix_images_alt_text(ticket):
                 'issue': issue, 'url': url}
 
     results = []
-    for image_url in images:
-        prompt = build_fix_alt_text_prompt(ctx['title'])
-        text, error = call_with_vision(image_url, prompt, agent="agent3", label=f"Alt text — {image_url}")
-        if error:
-            print(f"[Agent 3] Could not generate alt text for {image_url}: {error}")
-            results.append({'image_url': image_url, 'status': 'error', 'reason': error})
+    for img in images:
+        image_url = img['src']
+        prompt = build_fix_alt_text_prompt(ctx['title'], img)
+        try:
+            _, text, _, _ = call_with_tools([{'role': 'user', 'content': prompt}], [],
+                                             agent="agent3", label=f"Alt text — {image_url}")
+        except Exception as e:
+            print(f"[Agent 3] Could not generate alt text for {image_url}: {e}")
+            results.append({'image_url': image_url, 'status': 'error', 'reason': str(e)})
+            continue
+
+        if not text.strip():
+            reason = 'the AI call returned no usable text (no provider configured, or the model returned an empty response)'
+            print(f"[Agent 3] Could not generate alt text for {image_url}: {reason}")
+            results.append({'image_url': image_url, 'status': 'error', 'reason': reason})
             continue
 
         alt_text = '' if text.strip().upper() == 'DECORATIVE' else text.strip()
