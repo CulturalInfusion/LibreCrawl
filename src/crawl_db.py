@@ -716,6 +716,23 @@ def get_tickets_for_issues(pairs):
         print(f"Error getting tickets for issues: {e}")
         return {}
 
+def delete_devops_tickets(ticket_ids):
+    """Delete local devops_tickets rows for the given ticket_id values — called when a
+    ticket's Azure work item has moved to 'Removed' state (see main.py's
+    _filter_removed_tickets), so the stale local row doesn't keep matching a ticket that
+    should no longer block a fresh one for the same (url, issue) pair."""
+    if not ticket_ids:
+        return True
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['?'] * len(ticket_ids))
+            cursor.execute(f"DELETE FROM devops_tickets WHERE ticket_id IN ({placeholders})", list(ticket_ids))
+        return True
+    except Exception as e:
+        print(f"Error deleting devops tickets: {e}")
+        return False
+
 def get_issue_first_detected_bulk(pairs, user_id):
     if not pairs:
         return {}
