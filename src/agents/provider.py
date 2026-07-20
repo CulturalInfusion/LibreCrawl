@@ -3,6 +3,7 @@ import time
 import base64
 import requests
 from dotenv import load_dotenv
+from src.agents.url_safety import assert_safe_url
 load_dotenv()
 
 # Reasoning-quality models for the agentic loop.
@@ -152,6 +153,7 @@ def _fetch_image_bytes(image_url, max_bytes=5 * 1024 * 1024):
     live site, not just missing alt text, which is worth a human's attention even if no separate
     Broken Image ticket exists for it."""
     try:
+        assert_safe_url(image_url)
         resp = requests.get(image_url, timeout=10)
     except Exception as e:
         return None, None, f'network error fetching image: {e}'
