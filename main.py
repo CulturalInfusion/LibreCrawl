@@ -1775,6 +1775,47 @@ def create_devops_ticket():
         return jsonify({'success': True, **result})
     return jsonify({'success': False, 'error': result['error']}), 500
 
+def _filter_removed_tickets(tickets):
+    """Dedup safety net: a locally-stored devops_tickets row can point at a ticket_id whose
+    Azure work item has since moved to 'Removed' state — treating that as still 'exists'
+    would block a legitimate new ticket forever. Batch-fetches System.State for every
+    ticket_id in `tickets` via Azure's org-level work item batch GET (ticket IDs are unique
+    per-org; devops_tickets has no project column to scope a project-level call to).
+    Removed-state entries are dropped from the returned dict and their stale local rows
+    deleted. Fails open: any error talking to Azure returns `tickets` unfiltered — dedup is
+    a safety net, not a gate, matching the frontend's existing `.catch(() => {})` philosophy.
+    """
+    if not tickets:
+        return tickets
+    org = os.getenv('AZURE_DEVOPS_ORG')
+    pat = os.getenv('AZURE_DEVOPS_PAT')
+    if not org or not pat:
+        return tickets
+    try:
+        import base64
+        ticket_ids = list({str(t['ticket_id']) for t in tickets.values()})[:200]
+        token = base64.b64encode(f':{pat}'.encode()).decode()
+        headers = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}
+        batch_url = (
+            f'https://dev.azure.com/{org}/_apis/wit/workitems'
+            f'?ids={",".join(ticket_ids)}&fields=System.Id,System.State&api-version=7.1'
+        )
+        resp = requests.get(batch_url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        removed_ids = {
+            str(item['id']) for item in resp.json().get('value', [])
+            if item.get('fields', {}).get('System.State') == 'Removed'
+        }
+        if not removed_ids:
+            return tickets
+
+        from src.crawl_db import delete_devops_tickets
+        delete_devops_tickets([int(tid) for tid in removed_ids])
+        return {ck: t for ck, t in tickets.items() if str(t['ticket_id']) not in removed_ids}
+    except Exception as e:
+        print(f"[Dedup] Could not check Azure ticket states — skipping Removed-state filter: {e}")
+        return tickets
+
 @app.route('/api/devops_tickets/check', methods=['POST'])
 @login_required
 def check_devops_tickets():
@@ -1783,6 +1824,7 @@ def check_devops_tickets():
         data = request.get_json()
         pairs = data.get('pairs', [])
         tickets = get_tickets_for_issues(pairs)
+        tickets = _filter_removed_tickets(tickets)
         return jsonify({'success': True, 'tickets': tickets})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -1938,6 +1980,7 @@ def create_bulk_tickets():
 
     pairs    = [{'url': i.get('url',''), 'issue': i.get('issue',''), 'cache_key': _cache_key(i.get('url',''), i.get('issue',''))} for i in approved]
     existing = get_tickets_for_issues(pairs)
+    existing = _filter_removed_tickets(existing)
 
     for i, issue in enumerate(approved):
         url        = issue.get("url", "")
@@ -2155,8 +2198,12 @@ def qa_tickets_by_tag():
     try:
         token = base64.b64encode(f':{pat}'.encode()).decode()
         headers = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}
+        qa_state = os.getenv('AZURE_QA_STATE', 'QA')
         wiql_url = f'https://dev.azure.com/{org}/{url_quote(project)}/_apis/wit/wiql?api-version=7.1'
-        resp = requests.post(wiql_url, headers=headers, json={"query": f"SELECT [System.Id] FROM WorkItems WHERE [System.Tags] CONTAINS '{AZURE_QA_TAG}' ORDER BY [System.Id] DESC"}, timeout=10)
+        # Requires BOTH the tag AND state=='QA' — a ticket carrying only one (e.g. someone
+        # manually retagged or restated it outside the normal Agent 3 fix flow) shouldn't
+        # surface as a ready-to-check candidate here.
+        resp = requests.post(wiql_url, headers=headers, json={"query": f"SELECT [System.Id] FROM WorkItems WHERE [System.Tags] CONTAINS '{AZURE_QA_TAG}' AND [System.State] = '{qa_state}' ORDER BY [System.Id] DESC"}, timeout=10)
         resp.raise_for_status()
         work_items = resp.json().get('workItems', [])
         if not work_items:
