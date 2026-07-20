@@ -21,7 +21,7 @@ from src.agents.wordpress import (
     resolve_media_id, apply_alt_text, get_raw_content, map_to_target_url,
 )
 from src.agents.provider import call_with_tools
-from src.agents.url_safety import assert_safe_url
+from src.agents.url_safety import safe_get
 from src.agents.prompts import (
     build_plugin_decision_prompt, build_fix_title_prompt,
     build_fix_alt_text_prompt, build_fix_h1_prompt, build_fix_meta_description_prompt,
@@ -49,8 +49,7 @@ def _confirm_rendered(url, expected):
     empty dict means everything rendered. The '__title__' key checks the <title>
     element instead of a <meta> tag."""
     try:
-        assert_safe_url(url)
-        resp = requests.get(url, timeout=10)
+        resp = safe_get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
@@ -80,8 +79,7 @@ def _confirm_canonical_rendered(url, expected_href):
     a RankMath output/config issue, not a write failure, so the reason says so instead
     of just 'not found'."""
     try:
-        assert_safe_url(url)
-        resp = requests.get(url, timeout=10)
+        resp = safe_get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
@@ -104,8 +102,7 @@ def _fetch_current_meta_description(url):
     endpoint — confirmed live, only updateMeta/updateMetaBulk exist). Returns None if there's
     no current description tag at all, which is the accurate 'before' for a Missing ticket."""
     try:
-        assert_safe_url(url)
-        resp = requests.get(url, timeout=10)
+        resp = safe_get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception:
@@ -122,8 +119,7 @@ def _confirm_meta_description_rendered(url, expected_description):
     (canonical) while OpenGraph/Social tags render fine on the same page — description hasn't
     been assumed safe from the same failure, so this checks it explicitly instead."""
     try:
-        assert_safe_url(url)
-        resp = requests.get(url, timeout=10)
+        resp = safe_get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
@@ -143,8 +139,7 @@ def _confirm_h1_rendered(url):
     """Re-fetch url and check whether an <h1> now exists anywhere on the rendered page.
     Returns None if it does, or a reason string if the write didn't produce one."""
     try:
-        assert_safe_url(url)
-        resp = requests.get(url, timeout=10)
+        resp = safe_get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
@@ -171,8 +166,7 @@ def _wp_admin_check_link(site_url, object_type, object_id):
 def _fetch_page_context(url):
     """Re-fetch a page and pull title/H1/opening body text for LLM prompts."""
     try:
-        assert_safe_url(url)
-        resp = requests.get(url, timeout=10)
+        resp = safe_get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         title = soup.title.string.strip() if soup.title and soup.title.string else ''
@@ -195,8 +189,7 @@ def _fetch_images_without_alt(url):
     as _fetch_page_context.
     """
     try:
-        assert_safe_url(url)
-        resp = requests.get(url, timeout=10)
+        resp = safe_get(url, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception:
@@ -255,8 +248,7 @@ def _trace_redirect_chain(url, max_hops=10):
     """
     chain, current = [], url
     for _ in range(max_hops):
-        assert_safe_url(current)
-        resp = requests.get(current, allow_redirects=False, timeout=10)
+        resp = safe_get(current, allow_redirects=False, timeout=10)
         chain.append((current, resp.status_code))
         if resp.status_code in (301, 302, 303, 307, 308) and 'Location' in resp.headers:
             current = urljoin(current, resp.headers['Location'])

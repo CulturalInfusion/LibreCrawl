@@ -94,6 +94,25 @@ Compress(app)
 # Initialize database on startup
 init_db()
 
+def _safe_error(e, where):
+    """Log the real exception server-side and return a generic, client-safe message.
+    Returning str(e) (or a raw upstream response body) directly in an API response can
+    leak internal details — file paths, hostnames, stack traces, Azure DevOps error
+    bodies — to whoever calls the endpoint. See CodeQL 'information exposure through
+    an exception' (py/stack-trace-exposure)."""
+    print(f"[Error] {where}: {e}")
+    return 'An internal error occurred. Check server logs for details.'
+
+_PROJECT_NAME_RE = re.compile(r'^[A-Za-z0-9 ._-]{1,64}$')
+
+def _validate_project_name(project):
+    """Azure DevOps project names get interpolated directly into REST URL paths —
+    reject anything outside the character set Azure actually allows for a project
+    name, rather than relying on quote()'s percent-encoding alone to make an
+    arbitrary string safe to build a URL from. Raises ValueError if invalid."""
+    if not project or not _PROJECT_NAME_RE.match(project):
+        raise ValueError(f'invalid Azure DevOps project name: {project!r}')
+
 def generate_random_password(length=16):
     """Generate a random password with letters, digits, and symbols"""
     alphabet = string.ascii_letters + string.digits + string.punctuation
@@ -189,10 +208,10 @@ def skip_auth_login(username):
     except sqlite3.IntegrityError as e:
         # Most likely the generated email collides with an existing account
         # whose email happens to match. Fall back to a clearer message.
-        return False, f'Username conflict: try a different username ({e})'
+        return False, 'Username conflict: try a different username'
     except Exception as e:
         print(f"Error in skip_auth_login: {e}")
-        return False, f'Login error: {str(e)}'
+        return False, _safe_error(e, 'skip_auth_login')
 
 if LOCAL_MODE:
     print("=" * 60)
@@ -978,7 +997,7 @@ def visualization_data():
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e),
+            'error': _safe_error(e, 'visualization_data'),
             'nodes': [],
             'edges': []
         })
@@ -1052,7 +1071,7 @@ def filter_issues():
 
         return jsonify({'success': True, 'issues': filtered_issues})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'filter_issues')})
 
 @app.route('/api/get_settings')
 @login_required
@@ -1062,7 +1081,7 @@ def get_settings():
         settings = settings_manager.get_settings()
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'get_settings')})
 
 @app.route('/api/save_settings', methods=['POST'])
 @login_required
@@ -1073,7 +1092,7 @@ def save_settings():
         success, message = settings_manager.save_settings(data)
         return jsonify({'success': success, 'message': message})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'save_settings')})
 
 @app.route('/api/reset_settings', methods=['POST'])
 @login_required
@@ -1083,7 +1102,7 @@ def reset_settings():
         success, message = settings_manager.reset_settings()
         return jsonify({'success': success, 'message': message})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'reset_settings')})
 
 @app.route('/api/update_crawler_settings', methods=['POST'])
 @login_required
@@ -1096,7 +1115,7 @@ def update_crawler_settings():
         crawler.update_config(crawler_config)
         return jsonify({'success': True, 'message': 'Crawler settings updated'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'update_crawler_settings')})
 
 @app.route('/api/pause_crawl', methods=['POST'])
 @login_required
@@ -1106,7 +1125,7 @@ def pause_crawl():
         success, message = crawler.pause_crawl()
         return jsonify({'success': success, 'message': message})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'pause_crawl')})
 
 @app.route('/api/resume_crawl', methods=['POST'])
 @login_required
@@ -1116,7 +1135,7 @@ def resume_crawl():
         success, message = crawler.resume_crawl()
         return jsonify({'success': success, 'message': message})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'resume_crawl')})
 
 @app.route('/api/crawls/list')
 @login_required
@@ -1139,7 +1158,7 @@ def list_crawls():
             'total': total_count
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'list_crawls')})
 
 @app.route('/api/crawls/<int:crawl_id>')
 @login_required
@@ -1173,7 +1192,7 @@ def get_crawl(crawl_id):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'get_crawl')}), 500
 
 @app.route('/api/crawls/<int:crawl_id>/load', methods=['POST'])
 @login_required
@@ -1250,7 +1269,7 @@ def load_crawl_into_session(crawl_id):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'load_crawl_into_session')}), 500
 
 @app.route('/api/crawls/<int:crawl_id>/resume', methods=['POST'])
 @login_required
@@ -1278,7 +1297,7 @@ def resume_crawl_endpoint(crawl_id):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'resume_crawl_endpoint')})
 
 @app.route('/api/crawls/<int:crawl_id>/delete', methods=['DELETE'])
 @login_required
@@ -1299,7 +1318,7 @@ def delete_crawl_endpoint(crawl_id):
         success = delete_crawl(crawl_id)
         return jsonify({'success': success, 'message': 'Crawl deleted successfully' if success else 'Failed to delete crawl'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'delete_crawl_endpoint')})
 
 @app.route('/api/crawls/<int:crawl_id>/archive', methods=['POST'])
 @login_required
@@ -1320,7 +1339,7 @@ def archive_crawl(crawl_id):
         success = set_crawl_status(crawl_id, 'archived')
         return jsonify({'success': success, 'message': 'Crawl archived successfully' if success else 'Failed to archive crawl'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'archive_crawl')})
 
 @app.route('/api/crawls/stats')
 @login_required
@@ -1352,7 +1371,7 @@ def crawl_stats():
             'database_size_mb': get_database_size_mb()
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'crawl_stats')})
 
 @app.route('/api/export_data', methods=['POST'])
 @login_required
@@ -1497,7 +1516,7 @@ def export_data():
             })
 
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'export_data')})
 
 def recover_crashed_crawls():
     """Check for and recover any crashed crawls on startup"""
@@ -1655,7 +1674,7 @@ def explain_issue():
         print(f"AI Explain Error: {e}")
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error(e, 'explain_issue')
         }), 500
 
 def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_how_to_fix, ai_priority, ai_role, project, parent_id, assignee=None, user_id=None):
@@ -1670,6 +1689,10 @@ def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_h
     missing = [k for k, v in {'AZURE_DEVOPS_ORG': org, 'AZURE_DEVOPS_PAT': pat, 'AZURE_DEVOPS_SM_EMAIL': sm_email}.items() if not v]
     if missing:
         return False, {'error': f'Missing .env variables: {", ".join(missing)}'}
+    try:
+        _validate_project_name(project)
+    except ValueError as e:
+        return False, {'error': str(e)}
 
     if issue_type == 'error':
         az_priority, sup_label, moscow = (1, 'Critical', 'Must') if ai_priority == 'high' else (2, 'High', 'Should')
@@ -1739,9 +1762,9 @@ def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_h
         save_devops_ticket(url, issue, category, ticket_id, ticket_url, user_id=user_id)
         return True, {'ticket_id': ticket_id, 'ticket_url': ticket_url, 'title': title}
     except requests.exceptions.HTTPError:
-        return False, {'error': f'Azure DevOps {resp.status_code}: {resp.text}'}
+        return False, {'error': _safe_error(f'Azure DevOps {resp.status_code}: {resp.text}', '_create_single_ticket')}
     except Exception as e:
-        return False, {'error': str(e)}
+        return False, {'error': _safe_error(e, '_create_single_ticket')}
 
 
 @app.route('/api/create_devops_ticket', methods=['POST'])
@@ -1827,7 +1850,7 @@ def check_devops_tickets():
         tickets = _filter_removed_tickets(tickets)
         return jsonify({'success': True, 'tickets': tickets})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': _safe_error(e, 'check_devops_tickets')})
 
 @app.route('/api/devops/projects', methods=['GET'])
 @login_required
@@ -1846,7 +1869,7 @@ def devops_projects():
         projects = [{'id': p['id'], 'name': p['name']} for p in resp.json().get('value', [])]
         return jsonify({'success': True, 'projects': projects})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'devops_projects')}), 500
 
 
 @app.route('/api/devops/features', methods=['GET'])
@@ -1861,6 +1884,10 @@ def devops_features():
         return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG or AZURE_DEVOPS_PAT not configured'}), 400
     if not project:
         return jsonify({'success': False, 'error': 'project query param required'}), 400
+    try:
+        _validate_project_name(project)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     token    = base64.b64encode(f':{pat}'.encode()).decode()
     headers  = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}
     wiql_url = f'https://dev.azure.com/{org}/{quote(project)}/_apis/wit/wiql?api-version=7.1&$top=200'
@@ -1893,7 +1920,7 @@ def devops_features():
         ]
         return jsonify({'success': True, 'features': features})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'devops_features')}), 500
 
 _agent_state = {}
 _qa_bulk_state = {'running': False, 'results': None}
@@ -2034,7 +2061,7 @@ def create_bulk_tickets():
                         result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['reason'])
                 except Exception as e:
                     result['agent3_status'] = 'error'
-                    result['agent3_reason'] = f'Agent 3 failed: {e}'
+                    result['agent3_reason'] = _safe_error(e, 'create_bulk_tickets (Agent 3)')
 
             created.append(result)
         else:
@@ -2095,9 +2122,9 @@ def devops_identities():
                     members.append({'email': email, 'name': identity.get('displayName', email)})
         return jsonify({'success': True, 'members': members})
     except requests.exceptions.HTTPError:
-        return jsonify({'success': False, 'error': f'Azure DevOps {resp.status_code}: {resp.text}'}), 500
+        return jsonify({'success': False, 'error': _safe_error(f'Azure DevOps {resp.status_code}: {resp.text}', 'devops_identities')}), 500
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'devops_identities')}), 500
 
 
 @app.route("/api/agent/qa_check_ticket", methods=['POST'])
@@ -2120,7 +2147,7 @@ def agent_qa_check_ticket():
         result = check_ticket(project, ticket_id)
         return jsonify({'success': True, 'result': result})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'agent_qa_check_ticket')}), 500
 
 @app.route("/api/agent/qa_mark_done", methods=['POST'])
 @login_required
@@ -2136,7 +2163,7 @@ def agent_qa_mark_done():
         ok = mark_ticket_done(project, ticket_id)
         return jsonify({'success': ok})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'agent_qa_mark_done')}), 500
 
 @app.route("/api/agent/qa_post_comment", methods=['POST'])
 @login_required
@@ -2153,7 +2180,7 @@ def agent_qa_post_comment():
         ok = post_qa_comment(project, ticket_id, comment)
         return jsonify({'success': ok})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'agent_qa_post_comment')}), 500
 
 
 def _run_qa_bulk(ticket_ids, project):
@@ -2177,7 +2204,7 @@ def _run_qa_bulk(ticket_ids, project):
                     post_qa_comment(project, int(tid), comment)
                     collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'still_present'})
             except Exception as e:
-                collected.append({'ticket_id': tid, 'ticket_url': '', 'title': '', 'status': 'skipped', 'reason': str(e)})
+                collected.append({'ticket_id': tid, 'ticket_url': '', 'title': '', 'status': 'skipped', 'reason': _safe_error(e, '_run_qa_bulk')})
     finally:
         _qa_bulk_state = {'running': False, 'results': collected}
 
@@ -2191,6 +2218,10 @@ def qa_tickets_by_tag():
     project = request.args.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
     if not project:
         return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    try:
+        _validate_project_name(project)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     org = os.getenv('AZURE_DEVOPS_ORG')
     if not org:
         return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG not configured.'}), 500
@@ -2226,7 +2257,7 @@ def qa_tickets_by_tag():
             })
         return jsonify({'success': True, 'tickets': tickets})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _safe_error(e, 'qa_tickets_by_tag')}), 500
 
 
 @app.route("/api/agent/qa_bulk_run", methods=['POST'])
