@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.agents.provider import call_with_tools, get_provider
 from src.agents.tools    import REVIEW_TOOLS
 from src.agents.prompts  import REVIEW_AGENT_SYSTEM_PROMPT
+from src.crawl_db        import get_cached_explanations, save_issue_explanation
 
 POLL_INTERVAL = 3  # seconds between polling calls
 
@@ -47,7 +48,11 @@ def explain(issue):
     return {**issue, **explanation}
 
 def review_issues(issues):
-    """Call explain_issue once per unique (issue, category) pair, then apply to all matching issues.
+    """Check the per-URL explanation cache first, then call explain_issue once per unique
+    (issue, category) pair among the cache misses, then apply to all matching cache-miss
+    issues. Cache is strictly per (url, issue) — never shared across different URLs, even
+    ones with the same issue type, so a cached explanation stays specific to the URL that
+    actually needs the fix (see src/crawl_db.py's issue_explanations table).
     Returns list of dicts: {url, issue, category, type, priority, explanation, how_to_fix, role}
     Sort order: errors first, then warnings. Within each group, 'high' priority before 'medium'/'low'.
     """
@@ -55,9 +60,17 @@ def review_issues(issues):
     if not filtered:
         return []
 
-    # Collect one representative per unique (issue, category) — explanation is type-level, not URL-specific.
+    cached = get_cached_explanations(
+        [{'url': i['url'], 'issue': i['issue']} for i in filtered]
+    )
+    to_explain = [i for i in filtered if (i['url'], i['issue']) not in cached]
+
+    # Collect one representative per unique (issue, category) among cache misses only —
+    # explanation is type-level for generation purposes (still cheaper to generate once per
+    # crawl for issues sharing an (issue, category) pair), but gets cached per-URL below so
+    # future crawls only ever reuse an explanation for the exact URL it was written for.
     unique_pairs = {}
-    for i in filtered:
+    for i in to_explain:
         key = (i['issue'], i['category'])
         if key not in unique_pairs:
             unique_pairs[key] = i
@@ -79,8 +92,21 @@ def review_issues(issues):
                 print(f"explain_issue error for {key}: {e}")
                 explanations[key] = {}
 
-    ranked = [{**issue, **explanations.get((issue['issue'], issue['category']), {})}
-              for issue in filtered]
+    ranked = []
+    for issue in filtered:
+        cache_key = (issue['url'], issue['issue'])
+        if cache_key in cached:
+            merged = {**issue, **cached[cache_key]}
+        else:
+            result = explanations.get((issue['issue'], issue['category']), {})
+            merged = {**issue, **result}
+            if result.get('explanation'):
+                save_issue_explanation(
+                    issue['url'], issue['issue'], issue['category'],
+                    result.get('explanation'), result.get('how_to_fix'),
+                    result.get('priority'), result.get('role')
+                )
+        ranked.append(merged)
 
     priority_order = {'high': 0, 'medium': 1, 'low': 2}
     ranked = sorted(ranked, key=lambda i: priority_order.get(i.get('priority', 'low'), 2))
