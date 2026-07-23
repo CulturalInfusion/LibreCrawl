@@ -105,13 +105,49 @@ def _safe_error(e, where):
 
 _PROJECT_NAME_RE = re.compile(r'^[A-Za-z0-9 ._-]{1,64}$')
 
+_AZURE_PROJECTS_CACHE = {}  # org -> (fetched_at, {names})
+_AZURE_PROJECTS_CACHE_TTL = 300  # seconds; avoids one Azure call per ticket in a bulk batch
+
+def _get_valid_azure_project_names(org, pat):
+    """Live set of real project names in this Azure org, cached briefly. Returns None
+    (not an empty set) if the Azure API call itself fails, so callers can fall back to
+    format-only validation instead of wrongly rejecting every project during an Azure
+    outage or PAT issue unrelated to the request being validated."""
+    cached = _AZURE_PROJECTS_CACHE.get(org)
+    now = time.time()
+    if cached and now - cached[0] < _AZURE_PROJECTS_CACHE_TTL:
+        return cached[1]
+    import base64
+    try:
+        token = base64.b64encode(f':{pat}'.encode()).decode()
+        resp = requests.get(
+            f'https://dev.azure.com/{org}/_apis/projects?api-version=7.1&$top=100',
+            headers={'Authorization': f'Basic {token}'}, timeout=10
+        )
+        resp.raise_for_status()
+        names = {p['name'] for p in resp.json().get('value', [])}
+    except Exception as e:
+        print(f"[Warn] _get_valid_azure_project_names: {e}")
+        return None
+    _AZURE_PROJECTS_CACHE[org] = (now, names)
+    return names
+
 def _validate_project_name(project):
-    """Azure DevOps project names get interpolated directly into REST URL paths —
-    reject anything outside the character set Azure actually allows for a project
-    name, rather than relying on quote()'s percent-encoding alone to make an
-    arbitrary string safe to build a URL from. Raises ValueError if invalid."""
+    """Azure DevOps project names get interpolated directly into REST URL paths.
+    Layer 1 (always, no network): reject anything outside the character set Azure
+    actually allows for a project name. Layer 2 (best-effort): confirm it's a project
+    this org's Azure account actually has right now, via a briefly-cached live lookup —
+    real semantic validation instead of format-shape alone. Falls back to layer 1 only
+    if the live lookup is unavailable, rather than breaking ticket creation on an
+    unrelated Azure API hiccup. Raises ValueError if invalid."""
     if not project or not _PROJECT_NAME_RE.match(project):
         raise ValueError(f'invalid Azure DevOps project name: {project!r}')
+    org = os.getenv('AZURE_DEVOPS_ORG')
+    pat = os.getenv('AZURE_DEVOPS_PAT')
+    if org and pat:
+        valid_names = _get_valid_azure_project_names(org, pat)
+        if valid_names is not None and project not in valid_names:
+            raise ValueError(f'invalid Azure DevOps project name: {project!r}')
 
 def generate_random_password(length=16):
     """Generate a random password with letters, digits, and symbols"""
