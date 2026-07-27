@@ -716,6 +716,32 @@ def get_tickets_for_issues(pairs):
         print(f"Error getting tickets for issues: {e}")
         return {}
 
+def crawl_issues_exist(crawl_id, pairs):
+    """Return the subset of 'url|issue' keys from `pairs` that are real crawl_issues
+    rows for this crawl_id.
+
+    Used to confirm a ticket-approval request's claimed (url, issue) actually came
+    from a crawl LibreCrawl itself ran, rather than being fabricated in the request
+    body — the JSON a client sends is never trusted for what URL Agent 3 acts on
+    unless it matches something the server already generated and stored.
+    """
+    if not pairs or not crawl_id:
+        return set()
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['?'] * len(pairs))
+            params = [crawl_id] + [p['url'] + '|' + p['issue'] for p in pairs]
+            cursor.execute(
+                f"SELECT DISTINCT url || '|' || issue AS key FROM crawl_issues "
+                f"WHERE crawl_id = ? AND url || '|' || issue IN ({placeholders})",
+                params
+            )
+            return {row['key'] for row in cursor.fetchall()}
+    except Exception as e:
+        print(f"Error checking crawl_issues membership: {e}")
+        return set()
+
 def delete_devops_tickets(ticket_ids):
     """Delete local devops_tickets rows for the given ticket_id values — called when a
     ticket's Azure work item has moved to 'Removed' state (see main.py's
