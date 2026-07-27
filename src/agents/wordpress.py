@@ -3,6 +3,8 @@ import re
 import requests
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from src.agents.url_safety import safe_get, safe_post, safe_put
+
 
 # Known REST namespace -> WordPress.org plugin slug, for translating a site's
 # public /wp-json/ namespace list into an installable plugin list.
@@ -62,7 +64,7 @@ def _wp_auth():
 
 
 def _rest_get(base_url, route, **params):
-    resp = requests.get(
+    resp = safe_get(
         base_url.rstrip('/') + '/',
         auth=_wp_auth(),
         params={'rest_route': route, **params},
@@ -86,7 +88,7 @@ def _front_page_id(base_url):
     view, including a static front page. No auth needed.
     """
     try:
-        resp = requests.get(base_url, timeout=10)
+        resp = safe_get(base_url, timeout=10)
         resp.raise_for_status()
         match = re.search(r'page-id-(\d+)', resp.text)
         return int(match.group(1)) if match else None
@@ -153,12 +155,11 @@ def probe_site(url):
 
     Returns {'wp_version': str|None, 'namespaces': [...], 'theme': str|None, 'plugins': [...]}.
     """
-    parsed = urlparse(url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
+    base = _base_url(map_to_target_url(url))
 
     namespaces = []
     try:
-        resp = requests.get(f"{base}/wp-json/", timeout=10)
+        resp = safe_get(f"{base}/wp-json/", timeout=10)
         resp.raise_for_status()
         namespaces = resp.json().get('namespaces', [])
     except Exception:
@@ -169,7 +170,7 @@ def probe_site(url):
     wp_version = None
     theme = None
     try:
-        resp = requests.get(base, timeout=10)
+        resp = safe_get(base, timeout=10)
         resp.raise_for_status()
         html = resp.text
 
@@ -204,7 +205,7 @@ def apply_rankmath_meta(url, post_id, meta_dict):
     parsed = urlparse(mapped_url)
     api_url = f"{parsed.scheme}://{parsed.netloc}/?rest_route=/rankmath/v1/updateMeta"
 
-    resp = requests.post(
+    resp = safe_post(
         api_url,
         auth=_wp_auth(),
         json={'objectType': 'post', 'objectID': post_id, 'meta': meta_dict},
@@ -219,11 +220,11 @@ def apply_fix(url, post_id, object_type, field, new_value):
     Requires WP_USERNAME and WP_APP_PASSWORD in the environment (Application Password auth).
     Returns the new value of the field as confirmed by WordPress.
     """
-    parsed = urlparse(url)
+    parsed = urlparse(map_to_target_url(url))
     collection = 'pages' if object_type == 'page' else 'posts'
     api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/wp/v2/{collection}/{post_id}"
 
-    resp = requests.post(
+    resp = safe_post(
         api_url,
         auth=_wp_auth(),
         json={field: new_value},
@@ -292,7 +293,7 @@ def apply_alt_text(url, media_id, alt_text):
     parsed = urlparse(map_to_target_url(url))
     api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/wp/v2/media/{media_id}"
 
-    resp = requests.post(
+    resp = safe_post(
         api_url,
         auth=_wp_auth(),
         json={'alt_text': alt_text},
@@ -313,7 +314,7 @@ def get_raw_content(url, post_id, object_type):
     collection = 'pages' if object_type == 'page' else 'posts'
     api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/wp/v2/{collection}/{post_id}"
 
-    resp = requests.get(api_url, auth=_wp_auth(), params={'context': 'edit'}, timeout=10)
+    resp = safe_get(api_url, auth=_wp_auth(), params={'context': 'edit'}, timeout=10)
     resp.raise_for_status()
     return resp.json()['content']['raw']
 
@@ -340,7 +341,7 @@ def ensure_plugin_active(url, slug):
     status = get_plugin_status(base_url, slug)
 
     if status is None:
-        resp = requests.post(
+        resp = safe_post(
             base_url.rstrip('/') + '/',
             auth=_wp_auth(),
             params={'rest_route': '/wp/v2/plugins'},
@@ -351,7 +352,7 @@ def ensure_plugin_active(url, slug):
         status = resp.json().get('status')
 
     if status != 'active':
-        resp = requests.put(
+        resp = safe_put(
             base_url.rstrip('/') + '/',
             auth=_wp_auth(),
             params={'rest_route': f'/wp/v2/plugins/{slug}'},
@@ -386,7 +387,7 @@ def create_redirect_rule(url, source_path, target_url):
     base_url = _base_url(map_to_target_url(url))
     group_id = get_default_redirect_group(base_url)
 
-    resp = requests.post(
+    resp = safe_post(
         base_url.rstrip('/') + '/',
         auth=_wp_auth(),
         params={'rest_route': '/redirection/v1/redirect'},
