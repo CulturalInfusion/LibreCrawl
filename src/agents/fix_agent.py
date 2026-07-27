@@ -1053,7 +1053,7 @@ def add_ticket_comment(ticket_id, project, comment):
         return False
 
 
-def set_ticket_tag(ticket_id, project, tag):
+def set_ticket_tag(ticket_id, tag):
     """Add a tag to an Azure DevOps work item's System.Tags field without disturbing
     any tags already there. System.Tags is a single semicolon-separated string, and a
     PATCH 'add' on it REPLACES the whole field rather than appending — so the current
@@ -1064,9 +1064,10 @@ def set_ticket_tag(ticket_id, project, tag):
     """
     org = os.getenv('AZURE_DEVOPS_ORG')
     pat = os.getenv('AZURE_DEVOPS_PAT')
+    ticket_id = int(ticket_id)
 
     token   = base64.b64encode(f':{pat}'.encode()).decode()
-    api_url = f'https://dev.azure.com/{org}/{quote(project)}/_apis/wit/workitems/{ticket_id}?api-version=7.1'
+    api_url = f'https://dev.azure.com/{org}/_apis/wit/workitems/{ticket_id}?api-version=7.1'
     headers = {'Authorization': f'Basic {token}'}
 
     try:
@@ -1098,16 +1099,17 @@ def set_ticket_tag(ticket_id, project, tag):
         return False
 
 
-def set_ticket_state(ticket_id, project, state):
+def set_ticket_state(ticket_id, state):
     """Update an Azure DevOps work item's System.State field.
     Used to flag a ticket as ready for manual QA after Agent 3 applies a fix.
     Returns True on success, False on failure (logs the failure).
     """
     org = os.getenv('AZURE_DEVOPS_ORG')
     pat = os.getenv('AZURE_DEVOPS_PAT')
+    ticket_id = int(ticket_id)
 
     token   = base64.b64encode(f':{pat}'.encode()).decode()
-    api_url = f'https://dev.azure.com/{org}/{quote(project)}/_apis/wit/workitems/{ticket_id}?api-version=7.1'
+    api_url = f'https://dev.azure.com/{org}/_apis/wit/workitems/{ticket_id}?api-version=7.1'
     headers = {
         'Content-Type': 'application/json-patch+json',
         'Authorization': f'Basic {token}',
