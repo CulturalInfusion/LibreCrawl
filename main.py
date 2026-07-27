@@ -2374,7 +2374,8 @@ def qa_bulk_run():
     try:
         _validate_project_name(project)
     except ValueError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
+        app.logger.warning("Project validation failed in qa_bulk_run: %s", e)
+        return jsonify({'success': False, 'error': 'Invalid project value provided.'}), 400
     _qa_bulk_state = {'running': True, 'results': None}
     threading.Thread(target=_run_qa_bulk, args=(ticket_ids, project), daemon=True).start()
     return jsonify({'queued': True})
