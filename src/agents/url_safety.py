@@ -102,3 +102,19 @@ def safe_post(url, **kwargs):
     parsed, ip = _resolve_and_validate(url)
     with pin_dns(parsed.hostname, str(ip)):
         return requests.post(url, **kwargs)
+
+
+def safe_put(url, **kwargs):
+    """Same as safe_get()/safe_post() but for requests.put() — used by wordpress.py's
+    plugin-activation call, the one PUT-based write against a crawled-content-derived URL."""
+    parsed, ip = _resolve_and_validate(url)
+    with pin_dns(parsed.hostname, str(ip)):
+        return requests.put(url, **kwargs)
+
+
+def safe_head(url, **kwargs):
+    """Same as safe_get() but for requests.head() — used to re-probe a reported broken
+    link/image URL without fetching its full body."""
+    parsed, ip = _resolve_and_validate(url)
+    with pin_dns(parsed.hostname, str(ip)):
+        return requests.head(url, **kwargs)
