@@ -11,7 +11,6 @@ import os
 import re
 import base64
 import requests
-from urllib.parse import quote
 
 from src.crawler import check_single_url
 from src.agents.fix_agent import set_ticket_state, add_ticket_comment
@@ -50,11 +49,12 @@ def _parse_ticket_url(description):
     return match.group(1) if match else None
 
 
-def fetch_ticket(org, project, ticket_id):
-    """GET a single work item by ID with just the fields the QA check needs."""
+def fetch_ticket(org, ticket_id):
+    """GET a single work item by ID with just the fields the QA check needs.
+    """
     headers = _auth_headers()
     fields = 'System.Title,System.Description,System.State,System.Tags,Microsoft.VSTS.Common.AcceptanceCriteria'
-    url = f'https://dev.azure.com/{org}/{quote(project)}/_apis/wit/workitems/{ticket_id}?fields={fields}&api-version=7.1'
+    url = f'https://dev.azure.com/{org}/_apis/wit/workitems/{int(ticket_id)}?fields={fields}&api-version=7.1'
     resp = requests.get(url, headers=headers, timeout=10)
     resp.raise_for_status()
     return resp.json()
@@ -78,7 +78,7 @@ def _draft_fix_suggestion(url, issue, category):
     return None
 
 
-def check_ticket(project, ticket_id):
+def check_ticket(ticket_id):
     """Agent 4, read-only: fetch one ticket, validate it's in AZURE_QA_STATE AND carries
     the AZURE_QA_TAG tag, recover its url/issue from Title/Description, re-crawl the url,
     and return findings for a human to act on. Drafts an AI-suggested fix if the issue is
@@ -95,10 +95,10 @@ def check_ticket(project, ticket_id):
     org = os.getenv('AZURE_DEVOPS_ORG')
     qa_state = os.getenv('AZURE_QA_STATE', 'QA')
     qa_tag = os.getenv('AZURE_QA_TAG', 'qa-agent')
-    ticket_url = f'https://dev.azure.com/{org}/{quote(project)}/_workitems/edit/{ticket_id}'
+    ticket_url = f'https://dev.azure.com/{org}/_workitems/edit/{ticket_id}'
 
     try:
-        item = fetch_ticket(org, project, ticket_id)
+        item = fetch_ticket(org, ticket_id)
     except Exception as e:
         return {'ticket_id': ticket_id, 'ticket_url': ticket_url, 'state_ok': False,
                 'error': f'Could not fetch ticket #{ticket_id}: {e}'}
@@ -144,10 +144,10 @@ def check_ticket(project, ticket_id):
     return result
 
 
-def mark_ticket_done(project, ticket_id):
+def mark_ticket_done(ticket_id):
     """Human clicked 'Mark Done' — transitions the ticket to AZURE_QA_DONE_STATE."""
     done_state = os.getenv('AZURE_QA_DONE_STATE', 'Done')
-    return set_ticket_state(ticket_id, project, done_state)
+    return set_ticket_state(ticket_id, done_state)
 
 
 def post_qa_comment(project, ticket_id, comment):
