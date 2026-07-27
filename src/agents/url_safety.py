@@ -18,7 +18,6 @@ resolve via real DNS at all: the pinned call still connects, and the pin is
 provably torn down outside its scope.
 """
 import ipaddress
-import os
 import socket
 import threading
 from contextlib import contextmanager
@@ -31,24 +30,6 @@ class UnsafeURLError(ValueError):
     pass
 
 
-_ALLOWED_HOSTS = tuple(
-    h.strip().lower()
-    for h in os.getenv('OUTBOUND_ALLOWED_HOSTS', 'localhost').split(',')
-    if h.strip()
-)
-
-
-def _host_is_allowed(hostname):
-    host = (hostname or '').strip().lower().rstrip('.')
-    if not host:
-        return False
-    for allowed in _ALLOWED_HOSTS:
-        allowed = allowed.rstrip('.')
-        if host == allowed or host.endswith('.' + allowed):
-            return True
-    return False
-
-
 def _resolve_and_validate(url):
     """Shared by assert_safe_url() and safe_get()/safe_post(): parse url, resolve
     its host once, and raise UnsafeURLError unless it's a public http(s) address.
@@ -58,8 +39,6 @@ def _resolve_and_validate(url):
         raise UnsafeURLError(f'refusing to fetch non-http(s) URL: {url!r}')
     if not parsed.hostname:
         raise UnsafeURLError(f'refusing to fetch URL with no host: {url!r}')
-    if not _host_is_allowed(parsed.hostname):
-        raise UnsafeURLError(f'refusing to fetch URL with non-allowlisted host: {parsed.hostname!r}')
     try:
         addr = socket.gethostbyname(parsed.hostname)
         ip = ipaddress.ip_address(addr)
