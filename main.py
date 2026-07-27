@@ -628,6 +628,8 @@ def probe_http_errors():
     data = request.get_json()
     issues = data.get('issues', [])
 
+    from src.agents.url_safety import safe_head, UnsafeURLError
+
     resolved_urls = []
     BROKEN_IMAGE_PATTERNS = ['Broken Image']
     headers = {'User-Agent': 'LibreCrawlBot/1.0 (+https://librecrawl.com)'}
@@ -639,11 +641,13 @@ def probe_http_errors():
 
         if not probe_url:
             continue
-        try:    
-            response = requests.head(probe_url, allow_redirects=True, timeout=10, headers=headers)
+        try:
+            response = safe_head(probe_url, allow_redirects=True, timeout=10, headers=headers)
             status_code = response.status_code
             if status_code < 400:
                 resolved_urls.append({'url': issue.get('url', ''), 'issue': issue_name})
+        except UnsafeURLError:
+            continue
         except Exception as e:
             pass
 
@@ -849,7 +853,6 @@ def start_crawl():
         return jsonify({'success': False, 'error': 'URL is required'})
 
     user_id = session.get('user_id')
-    session_id = session.get('session_id')
     tier = session.get('tier', 'guest')
 
     # Check guest limits (IP-based) - skip in local mode
@@ -868,6 +871,7 @@ def start_crawl():
 
     # Get or create crawler for this session
     crawler = get_or_create_crawler()
+    session_id = session.get('session_id')
     settings_manager = get_session_settings()
 
     # Apply current settings to crawler before starting
@@ -1292,6 +1296,11 @@ def load_crawl_into_session(crawl_id):
 
         # Set Flask session flag for force full refresh
         session['force_full_refresh'] = True
+        # Without this, create_bulk_tickets' crawl_issues_exist() check would validate
+        # against whatever crawl_id was last set (crawl-start/resume) instead of the
+        # crawl actually being reviewed here — either wrongly rejecting real approvals
+        # or cross-referencing the wrong crawl's issues.
+        session['current_crawl_id'] = crawl_id
 
         return jsonify({
             'success': True,
@@ -1962,15 +1971,22 @@ _agent_state = {}
 _qa_bulk_state = {'running': False, 'results': None}
 
 @app.route("/api/agent/start_workflow", methods=['POST'])
+@login_required
 def start_workflow():
     if not AGENT2_ENABLED:
         return jsonify({'success': False, 'error': 'Agent 2 (review) is disabled — set AGENT2_ENABLED=true to enable.'}), 503
     global _agent_state
     data = request.get_json()
-    _agent_state["url"]     = data.get("url")
-    _agent_state["project"] = data.get("project")
-    _agent_state["feature"] = data.get("feature")
-    _agent_state["status"]  = "Workflow started"
+    _agent_state["url"]      = data.get("url")
+    _agent_state["project"]  = data.get("project")
+    _agent_state["feature"]  = data.get("feature")
+    # create_bulk_tickets' forged-request guard needs crawl_id, but its own call comes
+    # from mcp_server.py's http_session (a separate cookie jar, self-calling localhost) —
+    # session.get('current_crawl_id') would be empty for that caller. Captured here
+    # instead, same as project/feature above, since this route runs in the browser's own
+    # session where current_crawl_id is actually set.
+    _agent_state["crawl_id"] = session.get('current_crawl_id')
+    _agent_state["status"]   = "Workflow started"
     _agent_state["issues"]  = data.get("issues", [])
     _agent_state["results"] = None
 
@@ -1981,6 +1997,7 @@ def start_workflow():
     return jsonify({'success': True})
 
 @app.route("/api/agent/workflow_trigger", methods=['GET'])
+@login_required
 def workflow_trigger():
     global _agent_state
     if _agent_state.get("status") != "Workflow started":
@@ -1991,6 +2008,7 @@ def workflow_trigger():
     return jsonify({'ready': True, 'url': _agent_state.get("url"), 'project': _agent_state.get("project"), 'feature': _agent_state.get("feature"), 'issues': _agent_state.get("issues", [])})
 
 @app.route("/api/agent/review", methods=['POST'])
+@login_required
 def agent_review():
     global _agent_state
     data = request.get_json()
@@ -1999,6 +2017,7 @@ def agent_review():
     return jsonify({'success': True})
 
 @app.route("/api/agent/review", methods=['GET'])
+@login_required
 def get_review():
     global _agent_state
     if _agent_state.get("status") != "Review ready":
@@ -2006,6 +2025,7 @@ def get_review():
     return jsonify({'success': True, 'issues': _agent_state.get("review", [])})
 
 @app.route("/api/agent/approval", methods=['POST'])
+@login_required
 def agent_approval():
     global _agent_state
     data = request.get_json()
@@ -2014,6 +2034,7 @@ def agent_approval():
     return jsonify({'success': True})
 
 @app.route("/api/agent/approval", methods=['GET'])
+@login_required
 def get_approval():
     global _agent_state
     if _agent_state.get("status") != "Approval received":
@@ -2021,6 +2042,7 @@ def get_approval():
     return jsonify({'success': True, 'approval': _agent_state.get("approval", [])})
 
 @app.route("/api/agent/create_bulk_tickets", methods=['POST'])
+@login_required
 def create_bulk_tickets():
     global _agent_state
     data      = request.get_json()
@@ -2028,8 +2050,12 @@ def create_bulk_tickets():
     project   = _agent_state.get("project", "")
     parent_id = _agent_state.get("feature", "")
 
+    crawl_id = _agent_state.get('crawl_id')
+    if not crawl_id:
+        return jsonify({'success': False, 'error': 'No active crawl in this session — load or resume a crawl first.'}), 400
+
     import base64 as _b64
-    from src.crawl_db import get_tickets_for_issues
+    from src.crawl_db import get_tickets_for_issues, crawl_issues_exist
 
     created = []
     errors  = []
@@ -2044,11 +2070,20 @@ def create_bulk_tickets():
     pairs    = [{'url': i.get('url',''), 'issue': i.get('issue',''), 'cache_key': _cache_key(i.get('url',''), i.get('issue',''))} for i in approved]
     existing = get_tickets_for_issues(pairs)
     existing = _filter_removed_tickets(existing)
+    # `approved` is client-supplied JSON — only issues LibreCrawl itself detected during
+    # this session's crawl are eligible to become tickets (and reach Agent 3's fetch).
+    # Without this, a forged url in the request body would flow straight into run_fix().
+    valid_keys = crawl_issues_exist(crawl_id, pairs)
 
     for i, issue in enumerate(approved):
         url        = issue.get("url", "")
         issue_name = issue.get("issue", "")
         ck         = pairs[i]['cache_key']
+
+        if f"{url}|{issue_name}" not in valid_keys:
+            errors.append({'url': url, 'issue': issue_name,
+                            'error': 'This issue was not found in the current crawl — rejected.'})
+            continue
 
         if ck in existing:
             t = existing[ck]
@@ -2085,12 +2120,12 @@ def create_bulk_tickets():
                     if fix_result['status'] == 'fixed':
                         qa_state = os.getenv('AZURE_QA_STATE', 'QA')
                         result['agent3_qa_state'] = qa_state
-                        result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], project, qa_state)
-                        result['agent3_tag_added'] = set_ticket_tag(result['ticket_id'], project, AZURE_FIX_TAG)
+                        result['agent3_qa_updated'] = set_ticket_state(result['ticket_id'], qa_state)
+                        result['agent3_tag_added'] = set_ticket_tag(result['ticket_id'], AZURE_FIX_TAG)
                         # Agent 4's QA Bulk Run finds tickets by AZURE_QA_TAG, not by state —
                         # without this, a ticket Agent 3 fixes and moves to 'QA' state never
                         # surfaces in that checklist for Agent 4 to pick up automatically.
-                        result['agent3_qa_tag_added'] = set_ticket_tag(result['ticket_id'], project, AZURE_QA_TAG)
+                        result['agent3_qa_tag_added'] = set_ticket_tag(result['ticket_id'], AZURE_QA_TAG)
                         if fix_result.get('caveat'):
                             result['agent3_comment_added'] = add_ticket_comment(result['ticket_id'], project, fix_result['caveat'])
                     elif fix_result['status'] in ('skipped', 'error') and fix_result.get('reason'):
@@ -2108,6 +2143,7 @@ def create_bulk_tickets():
     return jsonify({'success': True, 'created': created, 'errors': errors})
 
 @app.route("/api/agent/results", methods=['GET'])
+@login_required
 def get_results():
     global _agent_state
     if _agent_state.get("status") != "Completed":
@@ -2172,15 +2208,16 @@ def agent_qa_check_ticket():
     if not AGENT4_ENABLED:
         return jsonify({'success': False, 'error': 'Agent 4 (QA) is disabled — set AGENT4_ENABLED=true to enable.'}), 503
     data = request.get_json()
-    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
     ticket_id = data.get('ticket_id')
-    if not project:
-        return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
     if not ticket_id:
         return jsonify({'success': False, 'error': 'No ticket ID provided.'}), 400
+    try:
+        ticket_id = int(ticket_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'ticket_id must be a number.'}), 400
     from src.agents.qa_agent import check_ticket
     try:
-        result = check_ticket(project, ticket_id)
+        result = check_ticket(ticket_id)
         return jsonify({'success': True, 'result': result})
     except Exception as e:
         return jsonify({'success': False, 'error': _safe_error(e, 'agent_qa_check_ticket')}), 500
@@ -2190,13 +2227,16 @@ def agent_qa_check_ticket():
 def agent_qa_mark_done():
     """Human clicked 'Mark Done' for a ticket Agent 4 confirmed as resolved."""
     data = request.get_json()
-    project = data.get('project') or os.getenv('AZURE_DEVOPS_PROJECT', '')
     ticket_id = data.get('ticket_id')
-    if not project or not ticket_id:
-        return jsonify({'success': False, 'error': 'project and ticket_id are required.'}), 400
+    if not ticket_id:
+        return jsonify({'success': False, 'error': 'ticket_id is required.'}), 400
+    try:
+        ticket_id = int(ticket_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'ticket_id must be a number.'}), 400
     from src.agents.qa_agent import mark_ticket_done
     try:
-        ok = mark_ticket_done(project, ticket_id)
+        ok = mark_ticket_done(ticket_id)
         return jsonify({'success': ok})
     except Exception as e:
         return jsonify({'success': False, 'error': _safe_error(e, 'agent_qa_mark_done')}), 500
@@ -2211,6 +2251,14 @@ def agent_qa_post_comment():
     comment = data.get('comment', '').strip()
     if not project or not ticket_id or not comment:
         return jsonify({'success': False, 'error': 'project, ticket_id, and comment are required.'}), 400
+    try:
+        _validate_project_name(project)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    try:
+        ticket_id = int(ticket_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'ticket_id must be a number.'}), 400
     from src.agents.qa_agent import post_qa_comment
     try:
         ok = post_qa_comment(project, ticket_id, comment)
@@ -2226,18 +2274,19 @@ def _run_qa_bulk(ticket_ids, project):
     try:
         for tid in ticket_ids:
             try:
-                result = check_ticket(project, int(tid))
+                tid_int = int(tid)
+                result = check_ticket(tid_int)
                 ticket_url = result.get('ticket_url', '')
                 title = result.get('title', '')
                 if result.get('error'):
                     collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'skipped', 'reason': result['error']})
                 elif not result.get('still_present'):
-                    mark_ticket_done(project, int(tid))
+                    mark_ticket_done(tid_int)
                     collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'done'})
                 else:
                     fix = result.get('ai_how_to_fix')
                     comment = f"Still detected: '{result.get('issue')}'. Suggested fix:\n{fix}" if fix else f"Still detected: '{result.get('issue')}' on {result.get('url')}."
-                    post_qa_comment(project, int(tid), comment)
+                    post_qa_comment(project, tid_int, comment)
                     collected.append({'ticket_id': tid, 'ticket_url': ticket_url, 'title': title, 'status': 'still_present'})
             except Exception as e:
                 collected.append({'ticket_id': tid, 'ticket_url': '', 'title': '', 'status': 'skipped', 'reason': _safe_error(e, '_run_qa_bulk')})
@@ -2266,18 +2315,27 @@ def qa_tickets_by_tag():
         token = base64.b64encode(f':{pat}'.encode()).decode()
         headers = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}
         qa_state = os.getenv('AZURE_QA_STATE', 'QA')
-        wiql_url = f'https://dev.azure.com/{org}/{url_quote(project)}/_apis/wit/wiql?api-version=7.1'
+        # Org-scoped (no project in the URL) — the Wiql REST API doesn't require project
+        # in the path, so it's expressed in the WHERE clause instead (safe: project was
+        # just validated above via _validate_project_name's character allowlist, which
+        # forbids the quote characters a WIQL string-literal breakout would need).
+        wiql_url = f'https://dev.azure.com/{org}/_apis/wit/wiql?api-version=7.1'
         # Requires BOTH the tag AND state=='QA' — a ticket carrying only one (e.g. someone
         # manually retagged or restated it outside the normal Agent 3 fix flow) shouldn't
         # surface as a ready-to-check candidate here.
-        resp = requests.post(wiql_url, headers=headers, json={"query": f"SELECT [System.Id] FROM WorkItems WHERE [System.Tags] CONTAINS '{AZURE_QA_TAG}' AND [System.State] = '{qa_state}' ORDER BY [System.Id] DESC"}, timeout=10)
+        query = (f"SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '{project}' "
+                 f"AND [System.Tags] CONTAINS '{AZURE_QA_TAG}' AND [System.State] = '{qa_state}' "
+                 f"ORDER BY [System.Id] DESC")
+        resp = requests.post(wiql_url, headers=headers, json={"query": query}, timeout=10)
         resp.raise_for_status()
         work_items = resp.json().get('workItems', [])
         if not work_items:
             return jsonify({'success': True, 'tickets': []})
         ids = ','.join(str(w['id']) for w in work_items)
         fields = 'System.Id,System.Title,System.State,System.Tags'
-        batch_url = f'https://dev.azure.com/{org}/{url_quote(project)}/_apis/wit/workitems?ids={ids}&fields={fields}&api-version=7.1'
+        # Also org-scoped — the work item ids are already resolved above, and the
+        # Work Items - List REST API doesn't require project in the path either.
+        batch_url = f'https://dev.azure.com/{org}/_apis/wit/workitems?ids={ids}&fields={fields}&api-version=7.1'
         resp2 = requests.get(batch_url, headers=headers, timeout=10)
         resp2.raise_for_status()
         tickets = []
@@ -2313,6 +2371,10 @@ def qa_bulk_run():
         return jsonify({'success': False, 'error': 'No ticket IDs provided.'}), 400
     if not project:
         return jsonify({'success': False, 'error': 'No Azure project selected.'}), 400
+    try:
+        _validate_project_name(project)
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     _qa_bulk_state = {'running': True, 'results': None}
     threading.Thread(target=_run_qa_bulk, args=(ticket_ids, project), daemon=True).start()
     return jsonify({'queued': True})
