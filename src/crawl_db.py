@@ -202,6 +202,27 @@ def init_crawl_tables():
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_devops_tickets_lookup ON devops_tickets (url, issue)')
 
+        # Caches explain_issue()'s AI output per (url, issue) so a recurring issue on a URL
+        # that's crawled repeatedly (e.g. fortnightly) doesn't re-spend tokens re-explaining
+        # something already explained on an earlier crawl of that exact URL. Strictly
+        # per-URL by design (not shared across different URLs with the same issue type) —
+        # a cached explanation is meant to be specific to the URL that needs the fix.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS issue_explanations (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                url         TEXT NOT NULL,
+                issue       TEXT NOT NULL,
+                category    TEXT,
+                explanation TEXT,
+                how_to_fix  TEXT,
+                priority    TEXT,
+                role        TEXT,
+                model       TEXT,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(url, issue)
+            )
+        ''')
+
         print("Crawl persistence tables initialized successfully")
 
 def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot):
@@ -757,6 +778,62 @@ def delete_devops_tickets(ticket_ids):
         return True
     except Exception as e:
         print(f"Error deleting devops tickets: {e}")
+        return False
+
+def get_cached_explanations(pairs):
+    """Look up previously-generated explain_issue() output for (url, issue) pairs, strictly
+    per-URL — a cached explanation is never reused for a different URL, even one with the
+    same issue type. pairs: list of {'url':..., 'issue':...}. Returns dict keyed by
+    (url, issue) tuple -> {explanation, how_to_fix, priority, role}."""
+    if not pairs:
+        return {}
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['?'] * len(pairs))
+            params = [p['url'] + '|' + p['issue'] for p in pairs]
+            cursor.execute(
+                f"SELECT url, issue, explanation, how_to_fix, priority, role "
+                f"FROM issue_explanations WHERE url || '|' || issue IN ({placeholders})",
+                params
+            )
+            rows = cursor.fetchall()
+
+        return {
+            (row['url'], row['issue']): {
+                'explanation': row['explanation'],
+                'how_to_fix': row['how_to_fix'],
+                'priority': row['priority'],
+                'role': row['role'],
+            }
+            for row in rows
+        }
+    except Exception as e:
+        print(f"Error getting cached explanations: {e}")
+        return {}
+
+def save_issue_explanation(url, issue, category, explanation, how_to_fix, priority, role, model=None):
+    """Persist explain_issue() output for one (url, issue) pair so a future crawl of this
+    exact URL can reuse it instead of re-asking the model. Upserts on (url, issue) — a
+    re-explained issue (e.g. after a prompt change) overwrites the stale cached text."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO issue_explanations (url, issue, category, explanation, how_to_fix, priority, role, model, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(url, issue) DO UPDATE SET
+                    category    = excluded.category,
+                    explanation = excluded.explanation,
+                    how_to_fix  = excluded.how_to_fix,
+                    priority    = excluded.priority,
+                    role        = excluded.role,
+                    model       = excluded.model,
+                    updated_at  = CURRENT_TIMESTAMP
+            ''', (url, issue, category, explanation, how_to_fix, priority, role, model))
+        return True
+    except Exception as e:
+        print(f"Error saving issue explanation: {e}")
         return False
 
 def get_issue_first_detected_bulk(pairs, user_id):

@@ -646,6 +646,23 @@ FIX_MAP = {
     'Missing Twitter Card Tags': fix_twitter_tags,
 }
 
+# Same three issue names run_fix()'s title branch matches on below — named here instead
+# of duplicated as a second inline tuple, so there's one literal list to keep in sync.
+TITLE_ISSUES = {'Missing Title Tag', 'Title Too Long', 'Title Too Short'}
+
+# Every issue name whose fix requires resolving the URL to an editable WordPress post/page
+# object first (run_fix() gates all of these behind resolve_wp_object() before generating
+# any fix — see the title branch, fix_missing_h1(), and the FIX_MAP dispatch below). This
+# is the complete list and nothing else: DEFER_REASONS/DEFER_PATTERNS issue types (Slow
+# Response Time, Broken Image, Noindex, 404s, redirects, etc.) never touch WordPress
+# resolution at all and must never be checked against this set — they're deferred for
+# reasons unrelated to whether a WP object exists, and would be silently and wrongly
+# dropped if this were ever applied to them (e.g. a real Broken Image issue on a page
+# that happens to be a category archive is still a real, human-actionable issue).
+# Consumed by ticket_review_agent.py's Agent 2 pre-check — grows automatically if FIX_MAP
+# grows, since it's derived from FIX_MAP.keys() rather than a second hand-maintained list.
+WP_OBJECT_REQUIRED_ISSUES = TITLE_ISSUES | {'Missing H1 Tag'} | set(FIX_MAP.keys())
+
 
 # Known REST namespaces for common WordPress image-compression plugins — checked against
 # probe_site()'s raw namespace list when deferring a page-size issue, so the ticket comment
@@ -799,7 +816,7 @@ def run_fix(ticket):
 
     print(f"[Agent 3] Received ticket: '{issue}' on {url}")
 
-    if issue in ('Missing Title Tag', 'Title Too Long', 'Title Too Short'):
+    if issue in TITLE_ISSUES:
         print("[Agent 3] Resolving WordPress content object...")
         try:
             wp_object = resolve_wp_object(url)
