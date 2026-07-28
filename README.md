@@ -256,7 +256,8 @@ Check out these example plugins to get started:
 ### Running Modes
 
 **Standard Mode** (default):
-- Full authentication system with login/register
+- Full authentication system with login/register — no default account; register your own
+  at `/register` (new accounts land on `Extra` tier), or continue as Guest
 - Tier-based access control (Guest, User, Extra, Admin)
 - Guest users limited to 3 crawls per 24 hours (IP-based)
 - Ideal for public-facing demos or shared hosting
@@ -266,6 +267,11 @@ Check out these example plugins to get started:
 - No rate limits or tier restrictions
 - Perfect for personal use or single-user self-hosting
 - Recommended for local development and testing
+- No login screen and no username/password to know — every request is auto-logged-in as a
+  shared local admin account. Logging out doesn't stay logged out: the very next request
+  logs back in automatically. This is by design (local mode means "skip auth entirely for
+  one trusted operator"), not a bug — if you need real, separate accounts, use Standard
+  Mode instead.
 
 ## Configuration
 
