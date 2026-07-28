@@ -92,6 +92,23 @@ Compress(app)
 # Initialize database on startup
 init_db()
 
+# Auto-provision a dedicated service account for mcp_server.py's internal calls, if
+# configured — lets Agent 2/3 authenticate for real in production mode instead of
+# relying entirely on LOCAL_MODE's auto-login side effect, which is all they had
+# before (the whole agent pipeline silently only ever worked with LOCAL_MODE=true).
+_MCP_SERVICE_USERNAME = os.getenv('MCP_SERVICE_USERNAME', '')
+_MCP_SERVICE_PASSWORD = os.getenv('MCP_SERVICE_PASSWORD', '')
+if _MCP_SERVICE_USERNAME and _MCP_SERVICE_PASSWORD:
+    _service_email = f'{_MCP_SERVICE_USERNAME}@internal.local'
+    if not get_user_by_email(_service_email):
+        _svc_success, _svc_message, _svc_user_id = create_user(_MCP_SERVICE_USERNAME, _service_email, _MCP_SERVICE_PASSWORD)
+        if _svc_success:
+            verify_user(_svc_user_id)
+            set_user_tier(_svc_user_id, 'admin')
+            print(f"[Startup] Provisioned MCP service account '{_MCP_SERVICE_USERNAME}'.")
+        else:
+            print(f"[Startup] Could not provision MCP service account: {_svc_message}")
+
 def _safe_error(e, where):
     """Log the real exception server-side and return a generic, client-safe message.
     Returning str(e) (or a raw upstream response body) directly in an API response can
