@@ -370,11 +370,20 @@ LibreCrawlPlugin.register({
                 container.querySelector('#agent-running').style.display = 'block';
                 this.renderTokenLog(container, ['agent2', 'agent3']);
 
-                await fetch('/api/agent/start_workflow', {
+                const startResp = await fetch('/api/agent/start_workflow', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url: rootUrl, project: ctx.project || '', feature: ctx.parentId || '', issues: issues })
                 });
+
+                if (!startResp.ok) {
+                    const err = await startResp.json().catch(() => ({}));
+                    this.utils.showNotification(err.error || 'Could not start Agent 2 — no active crawl in this session.', 'error');
+                    runBtn.disabled = false;
+                    container.querySelector('#agent-idle').style.display = 'block';
+                    container.querySelector('#agent-running').style.display = 'none';
+                    return;
+                }
 
                 const poll = setInterval(async () => {
                     this.renderTokenLog(container, ['agent2', 'agent3']);  // Agent 2's explain calls happen during this wait — keep the log live
