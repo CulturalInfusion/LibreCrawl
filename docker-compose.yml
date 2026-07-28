@@ -30,6 +30,10 @@ services:
       # - SMTP_FROM_NAME=${SMTP_FROM_NAME}
       # Add this for correct links in the verification emails
       # - MAIN_APP_URL=${MAIN_APP_URL}
+      # Dedicated account mcp_server.py logs in as for its internal calls into
+      # main.py's agent routes — required for Agent 2/3 to work with LOCAL_MODE=false.
+      - MCP_SERVICE_USERNAME=${MCP_SERVICE_USERNAME}
+      - MCP_SERVICE_PASSWORD=${MCP_SERVICE_PASSWORD}
       # AI / Azure integrations are optional; app startup must not require them.
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
