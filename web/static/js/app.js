@@ -203,6 +203,10 @@ function toggleCrawl() {
 }
 
 function startCrawl() {
+    if (crawlState.isRunning) {
+        return;
+    }
+
     const urlInput = document.getElementById('urlInput');
     let url = urlInput.value.trim();
 

@@ -20,6 +20,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.agents.provider import call_with_tools, get_provider
 from src.agents.tools    import REVIEW_TOOLS
 from src.agents.prompts  import REVIEW_AGENT_SYSTEM_PROMPT
+from src.crawl_db        import get_cached_explanations, save_issue_explanation
+from src.agents.wordpress import resolve_wp_object
+from src.agents.fix_agent import WP_OBJECT_REQUIRED_ISSUES
 
 POLL_INTERVAL = 3  # seconds between polling calls
 
@@ -47,7 +50,11 @@ def explain(issue):
     return {**issue, **explanation}
 
 def review_issues(issues):
-    """Call explain_issue once per unique (issue, category) pair, then apply to all matching issues.
+    """Check the per-URL explanation cache first, then call explain_issue once per unique
+    (issue, category) pair among the cache misses, then apply to all matching cache-miss
+    issues. Cache is strictly per (url, issue) — never shared across different URLs, even
+    ones with the same issue type, so a cached explanation stays specific to the URL that
+    actually needs the fix (see src/crawl_db.py's issue_explanations table).
     Returns list of dicts: {url, issue, category, type, priority, explanation, how_to_fix, role}
     Sort order: errors first, then warnings. Within each group, 'high' priority before 'medium'/'low'.
     """
@@ -55,9 +62,54 @@ def review_issues(issues):
     if not filtered:
         return []
 
-    # Collect one representative per unique (issue, category) — explanation is type-level, not URL-specific.
+    cached = get_cached_explanations(
+        [{'url': i['url'], 'issue': i['issue']} for i in filtered]
+    )
+    to_explain = [i for i in filtered if (i['url'], i['issue']) not in cached]
+
+    # WP-resolvability pre-check — free/zero-token REST, only for issue types whose fix
+    # actually needs an editable WordPress post/page (WP_OBJECT_REQUIRED_ISSUES, defined
+    # in fix_agent.py — the same set Agent 3 already gates real fixes behind). Never
+    # applied to anything else: a Broken Image or Slow Response Time issue on a
+    # non-resolvable page is still a real, human-actionable issue that has nothing to do
+    # with whether a WP object exists — those issue types are deferred via a completely
+    # separate mechanism (fix_agent.py's DEFER_REASONS/DEFER_PATTERNS) and must never be
+    # filtered here.
+    needs_wp_check  = [i for i in to_explain if i['issue'] in WP_OBJECT_REQUIRED_ISSUES]
+    no_check_needed = [i for i in to_explain if i['issue'] not in WP_OBJECT_REQUIRED_ISSUES]
+
+    resolvable_urls = {}
+    if needs_wp_check:
+        unique_urls = {i['url'] for i in needs_wp_check}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(resolve_wp_object, url): url for url in unique_urls}
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    resolvable_urls[url] = future.result() is not None
+                except Exception as e:
+                    print(f"resolve_wp_object error for {url}: {e}")
+                    # Fails open — an inconclusive check shouldn't silently drop a real
+                    # issue; worst case is one avoidable explain_issue call, same as
+                    # before this check existed.
+                    resolvable_urls[url] = True
+
+    not_resolvable_keys = {
+        (i['url'], i['issue']) for i in needs_wp_check if not resolvable_urls.get(i['url'], True)
+    }
+    resolvable = [i for i in needs_wp_check if (i['url'], i['issue']) not in not_resolvable_keys]
+
+    # Resolvable WP-required issues rejoin the normal pool so a resolvable URL can still
+    # become its (issue, category) group's representative, even if a non-resolvable one
+    # for the same issue type appeared earlier in the list.
+    to_explain = no_check_needed + resolvable
+
+    # Collect one representative per unique (issue, category) among cache misses only —
+    # explanation is type-level for generation purposes (still cheaper to generate once per
+    # crawl for issues sharing an (issue, category) pair), but gets cached per-URL below so
+    # future crawls only ever reuse an explanation for the exact URL it was written for.
     unique_pairs = {}
-    for i in filtered:
+    for i in to_explain:
         key = (i['issue'], i['category'])
         if key not in unique_pairs:
             unique_pairs[key] = i
@@ -79,8 +131,28 @@ def review_issues(issues):
                 print(f"explain_issue error for {key}: {e}")
                 explanations[key] = {}
 
-    ranked = [{**issue, **explanations.get((issue['issue'], issue['category']), {})}
-              for issue in filtered]
+    ranked = []
+    for issue in filtered:
+        cache_key = (issue['url'], issue['issue'])
+        if cache_key in not_resolvable_keys:
+            # Structural answer, not a generated one — nothing to cache, no AI call spent.
+            merged = {**issue, 'wp_resolvable': False,
+                      'explanation': ("This URL doesn't correspond to an editable WordPress "
+                                      "page — likely an archive, category, or dynamically-"
+                                      "generated page. Agent 3 won't be able to apply this fix."),
+                      'how_to_fix': '', 'priority': issue.get('priority', 'low')}
+        elif cache_key in cached:
+            merged = {**issue, **cached[cache_key]}
+        else:
+            result = explanations.get((issue['issue'], issue['category']), {})
+            merged = {**issue, **result}
+            if result.get('explanation'):
+                save_issue_explanation(
+                    issue['url'], issue['issue'], issue['category'],
+                    result.get('explanation'), result.get('how_to_fix'),
+                    result.get('priority'), result.get('role')
+                )
+        ranked.append(merged)
 
     priority_order = {'high': 0, 'medium': 1, 'low': 2}
     ranked = sorted(ranked, key=lambda i: priority_order.get(i.get('priority', 'low'), 2))
