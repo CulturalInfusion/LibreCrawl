@@ -334,6 +334,12 @@ def get_or_create_crawler():
             for existing_id, instance in crawler_instances.items():
                 if instance['crawler'].is_running:
                     session['session_id'] = existing_id
+                    # Adoption used to only restore session_id, leaving current_crawl_id
+                    # empty even though the crawler itself came back fine — the crawler
+                    # displayed live data while every crawl_id-dependent agent route
+                    # silently saw nothing.
+                    if instance['crawler'].crawl_id:
+                        session['current_crawl_id'] = instance['crawler'].crawl_id
                     instance['last_accessed'] = datetime.now()
                     print(f"Session {session_id} adopted running crawl from session {existing_id}")
                     return instance['crawler']
@@ -1737,7 +1743,8 @@ def _create_single_ticket(url, issue, category, issue_type, ai_explanation, ai_h
     try:
         _validate_project_name(project)
     except ValueError as e:
-        return False, {'error': str(e)}
+        app.logger.warning("Project validation failed in _create_single_ticket: %s", e)
+        return False, {'error': 'Invalid project value provided.'}
 
     if issue_type == 'error':
         az_priority, sup_label, moscow = (1, 'Critical', 'Must') if ai_priority == 'high' else (2, 'High', 'Should')
@@ -1932,7 +1939,8 @@ def devops_features():
     try:
         _validate_project_name(project)
     except ValueError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
+        app.logger.warning("Project validation failed in devops_features: %s", e)
+        return jsonify({'success': False, 'error': 'Invalid project value provided.'}), 400
     token    = base64.b64encode(f':{pat}'.encode()).decode()
     headers  = {'Authorization': f'Basic {token}', 'Content-Type': 'application/json'}
     wiql_url = f'https://dev.azure.com/{org}/{quote(project)}/_apis/wit/wiql?api-version=7.1&$top=200'
@@ -1977,15 +1985,21 @@ def start_workflow():
         return jsonify({'success': False, 'error': 'Agent 2 (review) is disabled — set AGENT2_ENABLED=true to enable.'}), 503
     global _agent_state
     data = request.get_json()
-    _agent_state["url"]      = data.get("url")
-    _agent_state["project"]  = data.get("project")
-    _agent_state["feature"]  = data.get("feature")
+
     # create_bulk_tickets' forged-request guard needs crawl_id, but its own call comes
     # from mcp_server.py's http_session (a separate cookie jar, self-calling localhost) —
     # session.get('current_crawl_id') would be empty for that caller. Captured here
-    # instead, same as project/feature above, since this route runs in the browser's own
-    # session where current_crawl_id is actually set.
-    _agent_state["crawl_id"] = session.get('current_crawl_id')
+    # instead, since this route runs in the browser's own session where current_crawl_id
+    # is actually set. Checked up front so a missing crawl_id fails immediately instead of
+    # surfacing 20 minutes later as a cryptic 400 on ticket creation.
+    crawl_id = session.get('current_crawl_id')
+    if not crawl_id:
+        return jsonify({'success': False, 'error': 'No active crawl in this session — start or load a crawl before running Agent 2.'}), 400
+
+    _agent_state["url"]      = data.get("url")
+    _agent_state["project"]  = data.get("project")
+    _agent_state["feature"]  = data.get("feature")
+    _agent_state["crawl_id"] = crawl_id
     _agent_state["status"]   = "Workflow started"
     _agent_state["issues"]  = data.get("issues", [])
     _agent_state["results"] = None
@@ -2140,7 +2154,7 @@ def create_bulk_tickets():
 
     _agent_state["results"] = {"created": created, "errors": errors}
     _agent_state["status"]  = "Completed"
-    return jsonify({'success': True, 'created': created, 'errors': errors})
+    return jsonify({'success': True})
 
 @app.route("/api/agent/results", methods=['GET'])
 @login_required
@@ -2254,7 +2268,8 @@ def agent_qa_post_comment():
     try:
         _validate_project_name(project)
     except ValueError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
+        app.logger.warning("Project validation failed in agent_qa_post_comment: %s", e)
+        return jsonify({'success': False, 'error': 'Invalid project value provided.'}), 400
     try:
         ticket_id = int(ticket_id)
     except (TypeError, ValueError):
@@ -2306,7 +2321,8 @@ def qa_tickets_by_tag():
     try:
         _validate_project_name(project)
     except ValueError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
+        app.logger.warning("Project validation failed in qa_tickets_by_tag: %s", e)
+        return jsonify({'success': False, 'error': 'Invalid project value provided.'}), 400
     org = os.getenv('AZURE_DEVOPS_ORG')
     if not org:
         return jsonify({'success': False, 'error': 'AZURE_DEVOPS_ORG not configured.'}), 500

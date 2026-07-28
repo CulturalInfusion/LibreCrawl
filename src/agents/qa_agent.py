@@ -102,8 +102,9 @@ def check_ticket(ticket_id):
     try:
         item = fetch_ticket(org, ticket_id)
     except Exception as e:
+        print(f"[Agent 4] Could not fetch ticket #{ticket_id}: {e}")
         return {'ticket_id': ticket_id, 'ticket_url': ticket_url, 'state_ok': False,
-                'error': f'Could not fetch ticket #{ticket_id}: {e}'}
+                'error': f'Could not fetch ticket #{ticket_id} — see server logs.'}
 
     fields = item.get('fields', {})
     state = fields.get('System.State', '')
@@ -136,7 +137,8 @@ def check_ticket(ticket_id):
     try:
         _, detected_issues = check_single_url(url)
     except Exception as e:
-        return {**base, 'state_ok': True, 'error': f'Could not re-check {url}: {e}'}
+        print(f"[Agent 4] Could not re-check {url}: {e}")
+        return {**base, 'state_ok': True, 'error': f'Could not re-check {url} — see server logs.'}
 
     still_present = any(i.get('issue') == issue for i in detected_issues)
     result = {**base, 'state_ok': True, 'still_present': still_present,

@@ -83,7 +83,8 @@ def _confirm_canonical_rendered(url, expected_href):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
-        return f'could not re-fetch page to verify: {e}'
+        print(f"[Agent 3] Could not re-fetch {url} to verify render: {e}")
+        return 'could not re-fetch page to verify — see server logs'
 
     tag = soup.find('link', rel='canonical')
     rendered = tag.get('href') if tag else None
@@ -123,7 +124,8 @@ def _confirm_meta_description_rendered(url, expected_description):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
-        return f'could not re-fetch page to verify: {e}'
+        print(f"[Agent 3] Could not re-fetch {url} to verify render: {e}")
+        return 'could not re-fetch page to verify — see server logs'
 
     tag = soup.find('meta', attrs={'name': 'description'})
     rendered = tag.get('content') if tag else None
@@ -143,7 +145,8 @@ def _confirm_h1_rendered(url):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
-        return f'could not re-fetch page to verify: {e}'
+        print(f"[Agent 3] Could not re-fetch {url} to verify render: {e}")
+        return 'could not re-fetch page to verify — see server logs'
     return None if soup.find('h1') else 'write succeeded but no &lt;h1&gt; is rendered on the page'
 
 
@@ -354,7 +357,7 @@ def fix_images_alt_text(ticket):
                                              agent="agent3", label=f"Alt text — {image_url}")
         except Exception as e:
             print(f"[Agent 3] Could not generate alt text for {image_url}: {e}")
-            results.append({'image_url': image_url, 'status': 'error', 'reason': str(e)})
+            results.append({'image_url': image_url, 'status': 'error', 'reason': 'the AI call failed — see server logs'})
             continue
 
         if not text.strip():
