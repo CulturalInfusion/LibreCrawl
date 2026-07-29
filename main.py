@@ -24,8 +24,8 @@ from src.agents.prompts import (
     build_explain_issue_prompt, EXPLAIN_ISSUE_SYSTEM_PROMPT,
     build_agent_chat_prompt, AGENT_CHAT_SYSTEM_PROMPT,
 )
-from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email, create_magic_link, verify_magic_link
-from src.email_service import send_verification_email, send_welcome_email, send_magic_link_email
+from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email
+from src.email_service import send_verification_email, send_welcome_email
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -76,8 +76,6 @@ DISABLE_REGISTER = args.disable_register
 DISABLE_GUEST = args.disable_guest or os.getenv('DISABLE_GUEST', '').lower() in ('true', '1', 'yes')
 DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'yes')
 SKIP_AUTH = args.dangerously_skip_auth or os.getenv('DANGEROUSLY_SKIP_AUTH', '').lower() in ('true', '1', 'yes')
-ALLOWED_EMAIL_DOMAIN = os.getenv('ALLOWED_EMAIL_DOMAIN', '')
-MAIN_APP_URL = os.getenv('MAIN_APP_URL', 'http://localhost:5000').rstrip('/')
 
 AGENT2_ENABLED = os.getenv('AGENT2_ENABLED', 'true').lower() != 'false'
 AGENT3_ENABLED = os.getenv('AGENT3_ENABLED', 'true').lower() != 'false'
@@ -93,6 +91,23 @@ Compress(app)
 
 # Initialize database on startup
 init_db()
+
+# Auto-provision a dedicated service account for mcp_server.py's internal calls, if
+# configured — lets Agent 2/3 authenticate for real in production mode instead of
+# relying entirely on LOCAL_MODE's auto-login side effect, which is all they had
+# before (the whole agent pipeline silently only ever worked with LOCAL_MODE=true).
+_MCP_SERVICE_USERNAME = os.getenv('MCP_SERVICE_USERNAME', '')
+_MCP_SERVICE_PASSWORD = os.getenv('MCP_SERVICE_PASSWORD', '')
+if _MCP_SERVICE_USERNAME and _MCP_SERVICE_PASSWORD:
+    _service_email = f'{_MCP_SERVICE_USERNAME}@internal.local'
+    if not get_user_by_email(_service_email):
+        _svc_success, _svc_message, _svc_user_id = create_user(_MCP_SERVICE_USERNAME, _service_email, _MCP_SERVICE_PASSWORD)
+        if _svc_success:
+            verify_user(_svc_user_id)
+            set_user_tier(_svc_user_id, 'admin')
+            print(f"[Startup] Provisioned MCP service account '{_MCP_SERVICE_USERNAME}'.")
+        else:
+            print(f"[Startup] Could not provision MCP service account: {_svc_message}")
 
 def _safe_error(e, where):
     """Log the real exception server-side and return a generic, client-safe message.
@@ -668,7 +683,7 @@ def login_page():
     # Redirect to app if already logged in
     if 'user_id' in session:
         return redirect(url_for('index'))
-    return render_template('login.html', registration_disabled=DISABLE_REGISTER, guest_disabled=DISABLE_GUEST, skip_auth=SKIP_AUTH, allowed_domain=ALLOWED_EMAIL_DOMAIN)
+    return render_template('login.html', registration_disabled=DISABLE_REGISTER, guest_disabled=DISABLE_GUEST, skip_auth=SKIP_AUTH)
 
 @app.route('/register')
 def register_page():
@@ -714,48 +729,22 @@ def verify_email():
                          app_source=app_source or 'main',
                          redirect_url=redirect_url)
 
-@app.route('/api/request-magic-link', methods=['POST'])
-def request_magic_link():
-    data = request.get_json() or {}
-    email = (data.get('email') or '').strip().lower()
-
-    if not email or '@' not in email:
-        return jsonify({'success': False, 'message': 'A valid email address is required.'})
-
-    if ALLOWED_EMAIL_DOMAIN and not email.endswith(f'@{ALLOWED_EMAIL_DOMAIN}'):
-        return jsonify({'success': False, 'message': f'Only @{ALLOWED_EMAIL_DOMAIN} addresses are allowed.'})
-
-    token = create_magic_link(email)
-    if not token:
-        return jsonify({'success': False, 'message': 'Failed to generate login link. Please try again.'})
-
-    magic_url = f"{MAIN_APP_URL}/auth/magic?token={token}"
-    send_magic_link_email(email, magic_url)
-    return jsonify({'success': True, 'message': 'Check your email for a login link.'})
-
-
-@app.route('/auth/magic', methods=['GET'])
-def magic_link_auth():
-    token = request.args.get('token', '').strip()
-    if not token:
-        return redirect(url_for('login_page', error='invalid'))
-
-    success, user_id, message = verify_magic_link(token)
-
-    if not success:
-        return redirect(url_for('login_page', error='invalid'))
-
-    user = get_user_by_id(user_id)
-    session['user_id'] = user_id
-    session['username'] = user['username']
-    session['tier'] = 'admin' if LOCAL_MODE else user['tier']
-    session.permanent = True
-    return redirect(url_for('index'))
-
-
 @app.route('/api/register', methods=['POST'])
 def register():
-    return jsonify({'success': False, 'message': 'Registration is not available. Use magic link login.'}), 410
+    if DISABLE_REGISTER:
+        return jsonify({'success': False, 'message': 'Registrations are disabled'}), 403
+
+    data = request.get_json() or {}
+    username = (data.get('username') or '').strip()
+    email = (data.get('email') or '').strip().lower()
+    password = data.get('password') or ''
+
+    success, message, user_id = create_user(username, email, password)
+    if not success:
+        return jsonify({'success': False, 'message': message})
+
+    verify_user(user_id)
+    return jsonify({'success': True, 'message': 'Account created. You can now log in.'})
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -772,7 +761,16 @@ def login():
         success, message = skip_auth_login(username)
         return jsonify({'success': success, 'message': message})
 
-    return jsonify({'success': False, 'message': 'Password login is not available. Use OTP login.'}), 410
+    success, message, user_data = authenticate_user(username, password)
+
+    if success:
+        session['user_id'] = user_data['id']
+        session['username'] = user_data['username']
+        # In local mode, always give admin tier
+        session['tier'] = 'admin' if LOCAL_MODE else user_data['tier']
+        session.permanent = True  # Remember login
+
+    return jsonify({'success': success, 'message': message})
 
 @app.route('/api/guest-login', methods=['POST'])
 def guest_login():

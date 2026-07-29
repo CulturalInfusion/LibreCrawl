@@ -13,7 +13,7 @@ Four agents run in sequence as part of the SEO audit workflow. Each agent has a 
 
 | File | Purpose |
 |------|---------|
-| `../mcp_server.py` | HTTP bridge between agents and the Flask app — all four agents import from here to start crawls, post triage results, poll approval, and create tickets. This is the communication layer; agents never call Flask routes directly. |
+| `../mcp_server.py` | HTTP bridge between agents and the Flask app — all four agents import from here to start crawls, post triage results, poll approval, and create tickets. This is the communication layer; agents never call Flask routes directly. Requires `MCP_SERVICE_USERNAME`/`MCP_SERVICE_PASSWORD` outside `LOCAL_MODE` — see `../../PageDiagnostic.md`'s "MCP Service Account" section. |
 | `provider.py` | LLM abstraction — supports Anthropic and OpenAI; unified `call_with_tools()` interface |
 | `tools.py` | Tool schemas for Agent 2's agentic mode (no-parameter design; Python handles all data flow) |
 | `wordpress.py` | WordPress REST API client used by Agent 3 — resolves posts/pages, applies RankMath meta, manages plugins, creates redirects |

@@ -49,8 +49,9 @@ agents, each a distinct step — not one "Ask AI" button:
   `src/agents/provider.py`'s usage log).
 - Chat panel (`/api/agent/chat`) for ad-hoc questions about the current issue list against
   whichever AI provider is configured.
-- Authorizing only users with the configured domain email as passwordless, via a magic
-  link (unrelated to the agent pipeline — pre-existing auth).
+- Standard username/password registration and login (unrelated to the agent pipeline —
+  base app auth; see README for local vs. production mode). New accounts land on `extra`
+  tier by default.
 
 ## The Agent Chain, End to End
 
@@ -69,29 +70,58 @@ agents, each a distinct step — not one "Ask AI" button:
 8. Once a ticket looks fixed, Agent 4 (per-ticket or bulk) re-crawls the URL to confirm
    before a human marks it Done.
 
+## MCP Service Account
+
+Step 2 above happens over real HTTP, not a function call — `mcp_server.py` calls back into
+`main.py`'s own `/api/agent/*` routes from inside the same process, as if it were a separate
+browser. Those routes require login. In `LOCAL_MODE=true`, that's invisible: every request,
+including this internal one, gets auto-logged-in as the shared local admin, so no credentials
+were ever needed. **In `LOCAL_MODE=false`, that auto-login doesn't happen, and Agent 2/3 cannot
+authenticate at all without this account** — every call fails with a 401 and the workflow
+silently never completes.
+
+**Setup:** set both in `.env`:
+```
+MCP_SERVICE_USERNAME=agent-service
+MCP_SERVICE_PASSWORD=<a strong random password, 8+ chars>
+```
+Left blank (the default), nothing changes — Agent 2/3 only work under `LOCAL_MODE=true`, same
+as before this existed. Set both, and the account auto-provisions on startup (`admin` tier, so
+it never hits guest-tier crawl limits) — no manual registration step needed. `mcp_server.py`
+logs in as this account the first time any call comes back unauthenticated, and re-logs-in the
+same way if the session goes stale later.
+
+This is a real standing `admin`-tier account, not a throwaway token — treat the password like
+any other credential in `.env`. One known, unfixed gap: `/api/login` has no rate-limiting, so a
+strong password is the only thing standing between this account and a guessing attempt.
+
 ## Modified/New Files
 
 - `.env.example` — copy to `.env`; AI provider keys, model names (orchestration vs.
   explain-tier are separate), Azure DevOps org/PAT/tags, per-agent enable flags
   (`AGENT2_ENABLED`/`AGENT3_ENABLED`/`AGENT4_ENABLED`), WordPress Application Password for
-  Agent 3's writes.
+  Agent 3's writes, MCP service account credentials (see "MCP Service Account" above).
 - `src/crawl_db.py` — `devops_tickets` table (dedup) and `issue_explanations` table
   (per-URL AI-explanation cache).
-- `src/auth_db.py` — magic-link auth table.
-- `src/email_service.py` — magic-link email sending.
+- `src/auth_db.py` — user accounts, tiers, verification tokens (base app auth, unrelated
+  to the agent pipeline).
+- `src/email_service.py` — verification/welcome emails (base app auth, unrelated to the
+  agent pipeline).
 - `src/agents/ticket_review_agent.py` — Agent 2, the review loop.
 - `src/agents/fix_agent.py` — Agent 3, `FIX_MAP` + WordPress-object-resolution gating.
 - `src/agents/qa_agent.py` — Agent 4, QA recheck.
 - `src/agents/wordpress.py` — shared WordPress REST helpers (`resolve_wp_object`,
   `apply_fix`, `probe_site`), all routed through `url_safety.py`'s guarded HTTP calls.
 - `src/mcp_server.py` — MCP tool definitions the agentic loop calls; self-calls
-  `main.py`'s own routes over HTTP via a dedicated `requests.Session()`.
+  `main.py`'s own routes over HTTP via a dedicated `requests.Session()`, authenticated as
+  a dedicated service account outside `LOCAL_MODE` (see "MCP Service Account" below).
 - `web/static/css/styles.css` — tab layout for varying screen sizes.
 - `web/static/js/app.js` — Azure project/board selectors, dynamic instead of hardcoded.
 - `web/static/js/plugin-loader.js` — tab-overflow fix on screen size changes.
 - `web/static/plugins/page-diagnostics.js` — the plugin itself: issue checklist,
   agent-run UI, ticket creation, QA panel, token-usage panel, chat panel.
-- `docker-compose.yml` — restricts self-hosted instances to the configured email domain.
+- `docker-compose.yml` — passes `MCP_SERVICE_USERNAME`/`MCP_SERVICE_PASSWORD` through to
+  the container (see "MCP Service Account" above).
 - `main.py` — `CATEGORY_ROLE_MAP` (issue category → responsible role), the full
   `/api/agent/*` route family (workflow start/trigger/review/approval/results, bulk ticket
   creation, QA single/bulk, token usage, provider selection, chat), plus the original
@@ -109,6 +139,8 @@ agents, each a distinct step — not one "Ask AI" button:
    creation will reject with "no project selected."
 4. Agent 3/4 require a real WordPress REST-accessible site; without WP credentials, Agent 3
    still runs but every fix defers with a clear reason instead of erroring.
+5. If you're running with `LOCAL_MODE=false`, set the MCP service account credentials (see
+   "MCP Service Account" above) — without it, Agent 2/3 will 401 on every run.
 
 ## Known Limitations (as of this doc)
 
