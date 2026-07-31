@@ -87,9 +87,13 @@ MCP_SERVICE_PASSWORD=<a strong random password, 8+ chars>
 ```
 Left blank (the default), nothing changes — Agent 2/3 only work under `LOCAL_MODE=true`, same
 as before this existed. Set both, and the account auto-provisions on startup (`admin` tier, so
-it never hits guest-tier crawl limits) — no manual registration step needed. `mcp_server.py`
-logs in as this account the first time any call comes back unauthenticated, and re-logs-in the
-same way if the session goes stale later.
+it never hits guest-tier crawl limits) — no manual registration step needed, but this only
+happens once: if you change `MCP_SERVICE_PASSWORD` later, restarting does **not** update the
+existing account as the old password stays active with no automatic rotation, so change it
+directly on the account instead. Internally it logs in under `{username}@internal.local`, worth
+knowing if you ever need to look the account up directly. `mcp_server.py` logs in as this
+account the first time any call comes back unauthenticated, and re-logs-in the same way if the
+session goes stale later.
 
 This is a real standing `admin`-tier account, not a throwaway token — treat the password like
 any other credential in `.env`. One known, unfixed gap: `/api/login` has no rate-limiting, so a
@@ -132,13 +136,14 @@ strong password is the only thing standing between this account and a guessing a
 1. `cp .env.example .env`, fill in at minimum: an AI provider key (`OPENAI_API_KEY` or
    `ANTHROPIC_API_KEY`) and its model names, `AZURE_DEVOPS_ORG`/`AZURE_DEVOPS_PAT`/
    `AZURE_DEVOPS_SM_EMAIL`, `AZURE_QA_STATE`/`AZURE_QA_DONE_STATE`/`AZURE_QA_TAG` matching
-   your Azure process's real state/tag names, and `WP_USERNAME`/`WP_APP_PASSWORD` if you
-   want Agent 3 to actually write fixes.
+   your Azure process's real state/tag names.
 2. `docker compose up -d` (see main `README.md` for the non-Docker path).
 3. Project and board must be selected in the plugin **before** crawling a site, or ticket
    creation will reject with "no project selected."
-4. Agent 3/4 require a real WordPress REST-accessible site; without WP credentials, Agent 3
-   still runs but every fix defers with a clear reason instead of erroring.
+4. Agent 3/4 require a real WordPress REST-accessible site with a matching entry under
+   Settings → Advanced → WordPress Sites (admin only, one Application Password per site);
+   without a matching entry, Agent 3 still runs but every fix defers with a clear reason
+   instead of erroring.
 5. If you're running with `LOCAL_MODE=false`, set the MCP service account credentials (see
    "MCP Service Account" above) — without it, Agent 2/3 will 401 on every run.
 
